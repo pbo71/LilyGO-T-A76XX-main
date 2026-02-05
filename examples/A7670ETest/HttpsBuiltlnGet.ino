@@ -20,11 +20,25 @@
 #include <OneWire.h>
 #include <esp32-hal-adc.h>
 #include <max6675.h>
+#include <esp_wifi.h>
+#include <esp_bt.h>
+#include "driver/adc.h"
+#include "esp_adc_cal.h"
+#include "WiFi.h"
 
 #define ONE_WIRE_BUS 0
 
 #define uS_TO_S_FACTOR 1000000ULL /* Conversion factor for micro seconds to seconds */
 #define TIME_TO_SLEEP 60 * 20     /* Time ESP32 will go to sleep (in seconds) */
+
+// Define constants instead of magic numbers
+#define RETRY_COUNT 3
+#define MAX_URL_LENGTH 192
+#define VOLTAGE_MULTIPLIER 2
+#define MODEM_INIT_RETRY 10
+#define SLEEP_DURATION_MINUTES 20
+#define CHECK_BATTERY_THRESHOLD 3600  // 3.6V in millivolts
+#define DEEP_SLEEP_THRESHOLD 3400     // 3.4V in millivolts
 
 // Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
 OneWire oneWire(ONE_WIRE_BUS);
@@ -84,6 +98,23 @@ void chargingFunction()
     }
 }
 
+// Improve the existing charging function
+void optimizedChargingFunction() {
+    uint32_t battery_voltage = analogReadMilliVolts(BOARD_BAT_ADC_PIN) * 2;
+    
+    static const uint32_t CHARGING_START_THRESHOLD = 3800;  // 3.8V
+    static const uint32_t CHARGING_STOP_THRESHOLD = 4200;   // 4.2V
+    
+    if (battery_voltage >= CHARGING_STOP_THRESHOLD) {
+        digitalWrite(RELAY_PIN, HIGH);  // Stop charging
+        isCharning = false;
+    } else if (battery_voltage < CHARGING_START_THRESHOLD) {
+        digitalWrite(RELAY_PIN, LOW);   // Start charging
+        isCharning = true;
+    }
+    // No change if voltage is between thresholds (hysteresis)
+}
+
 void powerModemDown()
 {
     // Pull up DTR to put the modem into sleep
@@ -91,7 +122,7 @@ void powerModemDown()
     digitalWrite(MODEM_DTR_PIN, HIGH);
 
     // Delay sometime ...
-    delay(5000);
+    delay(5000);  // Keep this longer for modem to respond
 
     Serial.println("Check modem online .");
     while (!modem.testAT())
@@ -101,7 +132,7 @@ void powerModemDown()
     }
     Serial.println("Modem is online !");
 
-    delay(5000);
+    delay(5000);  // Keep this longer
 
     Serial.println("Enter modem power off!");
 
@@ -114,7 +145,7 @@ void powerModemDown()
         Serial.println("modem power off failed!");
     }
 
-    delay(5000);
+    delay(5000);  // Keep this longer
 
     Serial.println("Check modem response .");
     while (modem.testAT())
@@ -132,19 +163,86 @@ void powerModemDown()
 #endif
 
 #ifdef MODEM_RESET_PIN
-    // Keep it low during the sleep period. If the module uses GPIO5 as reset,
-    // there will be a pulse when waking up from sleep that will cause the module to start directly.
-    // https://github.com/Xinyuan-LilyGO/LilyGO-T-A76XX/issues/85
+    // Keep it low during the sleep period
     digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
     gpio_hold_en((gpio_num_t)MODEM_RESET_PIN);
     gpio_deep_sleep_hold_en();
 #endif
 
     Serial.println("Enter esp32 goto deepsleep!");
+    Serial.flush();
+    
     esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
     delay(200);
     esp_deep_sleep_start();
-    Serial.println("This will never be printed");
+}
+
+bool setupNetwork(uint8_t maxAttempts = 3) {
+    Serial.println("Setting up network connection...");
+    
+    // Check modem registration status
+    RegStatus status;
+    uint8_t attempts = 0;
+    
+    while (attempts < maxAttempts) {
+        status = modem.getRegistrationStatus();
+        
+        switch (status) {
+            case REG_OK_HOME:
+                Serial.println("Registered to home network");
+                break;
+            case REG_OK_ROAMING:
+                Serial.println("Registered to roaming network");
+                break;
+            case REG_SEARCHING:
+                Serial.println("Searching for network...");
+                delay(2000);
+                attempts++;
+                continue;
+            case REG_DENIED:
+                Serial.println("Network registration denied!");
+                return false;
+            case REG_UNREGISTERED:
+            case REG_UNKNOWN:
+                Serial.println("Not registered to network");
+                delay(2000);
+                attempts++;
+                continue;
+            default:
+                Serial.printf("Unknown registration status: %d\n", status);
+                delay(2000);
+                attempts++;
+                continue;
+        }
+        
+        // If we're here, we're registered (either home or roaming)
+        if (status == REG_OK_HOME || status == REG_OK_ROAMING) {
+            // Check signal quality
+            int16_t signalQuality = modem.getSignalQuality();
+            Serial.printf("Signal Quality: %d\n", signalQuality);
+            
+            // Enable network connection
+            if (modem.enableNetwork()) {
+                // Wait for network to stabilize
+                delay(5000);
+                
+                // Verify we have an IP address
+                String ip = modem.getLocalIP();
+                if (ip != "0.0.0.0" && ip.length() > 0) {
+                    Serial.printf("Network connected with IP: %s\n", ip.c_str());
+                    return true;
+                }
+            }
+            
+            Serial.println("Failed to enable network");
+        }
+        
+        attempts++;
+        delay(1000);
+    }
+    
+    Serial.println("Network setup failed after maximum attempts");
+    return false;
 }
 
 void setup()
@@ -166,6 +264,19 @@ void setup()
         }
         Serial.println("TurnON Modem!");
     }
+
+    // Configure ADC for power saving
+    analogSetPinAttenuation(BOARD_BAT_ADC_PIN, ADC_11db);
+    analogSetClockDiv(255);
+    
+    // Disable WiFi and Bluetooth
+    disableWiFiAndBT();
+    
+    // Use optimized charging
+    optimizedChargingFunction();
+    
+    // Optimize modem power
+    optimizeModemPower();
 
     analogSetAttenuation(ADC_11db);
     analogReadResolution(12);
@@ -409,3 +520,107 @@ void loop()
     }
     delay(1);
 }
+
+// Add this function to handle sleep mode
+void enterSleepMode(uint32_t battery_voltage) {
+    if (battery_voltage < DEEP_SLEEP_THRESHOLD) {
+        Serial.println("Battery low, entering deep sleep...");
+        
+        // Properly handle Dallas temperature sensor
+        Dallas_sensors.setResolution(9);  // Set lowest resolution to save power
+        Dallas_sensors.requestTemperatures();  // Complete any pending operations
+        
+        // Power down other peripherals
+        digitalWrite(BOARD_PWRKEY_PIN, LOW);
+        
+        // Enter deep sleep for longer duration
+        esp_sleep_enable_timer_wakeup(SLEEP_DURATION_MINUTES * 2 * 60 * uS_TO_S_FACTOR);
+    } else {
+        Serial.println("Entering normal sleep cycle...");
+        esp_sleep_enable_timer_wakeup(SLEEP_DURATION_MINUTES * 60 * uS_TO_S_FACTOR);
+    }
+    
+    // Configure GPIO pins for sleep
+    gpio_deep_sleep_hold_en();
+    
+    Serial.println("Entering deep sleep...");
+    Serial.flush();
+    
+    esp_deep_sleep_start();
+}
+
+// Add this function for modem power optimization
+void optimizeModemPower() {
+    // Disable unnecessary modem features
+    modem.sendAT("+CFUN=0");  // Minimum functionality
+    modem.sendAT("+CSCLK=2"); // Enable deep sleep mode
+    
+    // Only enable full functionality when needed
+    modem.sendAT("+CFUN=1");
+    // Wait for network registration
+    delay(2000);
+}
+
+// Add this function for efficient sensor reading
+bool readSensorsWithTimeout() {
+    unsigned long timeout = millis();
+    const unsigned long SENSOR_TIMEOUT = 1000; // 1 second timeout
+    
+    Dallas_sensors.requestTemperatures();
+    while (!Dallas_sensors.isConversionComplete()) {
+        if (millis() - timeout > SENSOR_TIMEOUT) {
+            return false;
+        }
+        delay(10);
+    }
+    return true;
+}
+
+// Add this function for handling connection failures
+void handleConnectionFailure() {
+    static uint8_t failureCount = 0;
+    failureCount++;
+    
+    if (failureCount >= 3) {
+        Serial.println("Multiple connection failures, entering long sleep...");
+        esp_sleep_enable_timer_wakeup(SLEEP_DURATION_MINUTES * 3 * 60 * uS_TO_S_FACTOR);
+        esp_deep_sleep_start();
+    }
+}
+
+void disableWiFiAndBT() {
+    // Disable WiFi
+    WiFi.mode(WIFI_OFF);
+    
+    // Initialize WiFi before trying to stop it
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_err_t result = esp_wifi_init(&cfg);
+    if (result == ESP_OK) {
+        result = esp_wifi_stop();
+        if (result == ESP_OK) {
+            result = esp_wifi_deinit();
+            if (result != ESP_OK) {
+                Serial.printf("WiFi deinit failed with error: %d\n", result);
+            }
+        } else {
+            Serial.printf("WiFi stop failed with error: %d\n", result);
+        }
+    } else {
+        Serial.printf("WiFi init failed with error: %d\n", result);
+    }
+
+    // Disable Bluetooth
+    btStop();
+    if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+        if (esp_bt_controller_disable() != ESP_OK) {
+            Serial.println("BT controller disable failed");
+        }
+    }
+    
+    if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_INITED) {
+        if (esp_bt_controller_mem_release(ESP_BT_MODE_BTDM) != ESP_OK) {
+            Serial.println("BT controller memory release failed");
+        }
+    }
+}
+

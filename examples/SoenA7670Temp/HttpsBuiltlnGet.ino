@@ -11,26 +11,34 @@
  */
 #define TINY_GSM_RX_BUFFER 1024 // Set RX buffer to 1Kb
 
-// See all AT commands, if wanted
-// #define DUMP_AT_COMMANDS
+// debug: set 0 to remove Serial prints to save power
+#define DEBUG 0
+
+#if DEBUG
+  #define LOG(fmt, ...) Serial.printf(fmt, ##__VA_ARGS__)
+#else
+  #define LOG(fmt, ...)
+#endif
 
 #include "utilities.h"
+#include "WiFi.h"
+#include <esp_wifi.h>
 #include <TinyGsmClient.h>
-#include <DallasTemperature.h>
-#include <OneWire.h>
+//#include <DallasTemperature.h>
+//#include <OneWire.h>
 #include <esp32-hal-adc.h>
 #include <max6675.h>
 
-#define ONE_WIRE_BUS 0
+//#define ONE_WIRE_BUS 0
 
 #define uS_TO_S_FACTOR 1000000ULL /* Conversion factor for micro seconds to seconds */
-#define TIME_TO_SLEEP 60 * 20     /* Time ESP32 will go to sleep (in seconds) */
+#define TIME_TO_SLEEP 60 * 5     /* Time ESP32 will go to sleep (in seconds) */
 
 // Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
-OneWire oneWire(ONE_WIRE_BUS);
+//OneWire oneWire(ONE_WIRE_BUS);
 
 // Pass our oneWire reference to Dallas Temperature.
-DallasTemperature Dallas_sensors(&oneWire);
+//DallasTemperature Dallas_sensors(&oneWire);
 
 MAX6675 thermocouple(GPIO_NUM_18, BOARD_SD_CS_PIN, GPIO_NUM_19);
 
@@ -138,74 +146,76 @@ void chargingFunction()
 
 void powerModemDown()
 {
+    // Disable WiFi and Bluetooth before sleep
+    WiFi.mode(WIFI_OFF);
+    esp_wifi_stop(); // ensure WiFi radio is fully stopped
+    btStop();
+
     // Pull up DTR to put the modem into sleep
     pinMode(MODEM_DTR_PIN, OUTPUT);
     digitalWrite(MODEM_DTR_PIN, HIGH);
+    delay(5000);  // Keep this longer for modem to respond
 
-    // Delay sometime ...
-    delay(5000);
-
-    Serial.println("Check modem online .");
+    LOG("Check modem online.\n");
+    unsigned long start = millis();
     while (!modem.testAT())
     {
-        Serial.print(".");
+        if (millis() - start > 10000) break; // timeout to avoid long blocking
+        LOG(".");
         delay(500);
     }
-    Serial.println("Modem is online !");
+    LOG("Modem is online!\n");
+    delay(5000);  // Keep this longer
 
-    delay(5000);
-
-    Serial.println("Enter modem power off!");
-
+    LOG("Enter modem power off!\n");
     if (modem.poweroff())
     {
-        Serial.println("Modem enter power off modem!");
+        LOG("Modem power off successful!\n");
     }
     else
     {
-        Serial.println("modem power off failed!");
+        LOG("Modem power off failed!\n");
     }
 
-    delay(5000);
+    delay(5000);  // Keep this longer
 
-    Serial.println("Check modem response .");
-    while (modem.testAT())
-    {
-        Serial.print(".");
-        delay(500);
-    }
-    Serial.println("Modem is not respone ,modem has power off !");
-
-    delay(5000);
+    // Flush serial to ensure all data is sent
+    Serial.flush();
+    SerialAT.flush();
 
 #ifdef BOARD_POWERON_PIN
-    // Turn on DC boost to power off the modem
     digitalWrite(BOARD_POWERON_PIN, LOW);
 #endif
 
 #ifdef MODEM_RESET_PIN
-    // Keep it low during the sleep period. If the module uses GPIO5 as reset,
-    // there will be a pulse when waking up from sleep that will cause the module to start directly.
-    // https://github.com/Xinyuan-LilyGO/LilyGO-T-A76XX/issues/85
+    // Set reset pin low during sleep
     digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
     gpio_hold_en((gpio_num_t)MODEM_RESET_PIN);
     gpio_deep_sleep_hold_en();
 #endif
 
-    Serial.println("Enter esp32 goto deepsleep!");
+    LOG("Entering deep sleep...\n");
+    Serial.flush();
+
     esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
     delay(200);
     esp_deep_sleep_start();
-    Serial.println("This will never be printed");
 }
 
 void setup()
 {
     Serial.begin(115200); // Set console baud rate
 
-    Serial.println("Start Sketch");
+    // reduce CPU frequency to save power while active
+    setCpuFrequencyMhz(80);
+
+    LOG("Start Sketch\n");
 
     SerialAT.begin(115200, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
+
+    // Disable WiFi and Bluetooth to save power
+    WiFi.mode(WIFI_OFF);
+    btStop();
 
     if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER)
     {
@@ -221,12 +231,12 @@ void setup()
         Serial.println("TurnON Modem!");
     }
 
-    analogSetAttenuation(ADC_11db);
+    //analogSetAttenuation(ADC_11db);
 
-    analogReadResolution(12);
+    //analogReadResolution(12);
 
 #if CONFIG_IDF_TARGET_ESP32
-    analogSetWidth(12);
+    //analogSetWidth(12);
 #endif
 
 #ifdef BOARD_POWERON_PIN
@@ -249,7 +259,7 @@ void setup()
     delay(100);
     digitalWrite(BOARD_PWRKEY_PIN, LOW);
 
-    Dallas_sensors.begin();
+    //Dallas_sensors.begin();
 
     // Check if the modem is online
     Serial.println("Start modem...");
@@ -364,10 +374,10 @@ void setup()
     Serial.print("Network IP:");
     Serial.println(ipAddress);
 
-    Dallas_sensors.requestTemperatures(); // Send the command to get temperatures
-    Serial.print("Temperature for the device 1 (index 0) is: ");
-    float temp = Dallas_sensors.getTempCByIndex(0);
-    Serial.println(temp);
+    //Dallas_sensors.requestTemperatures(); // Send the command to get temperatures
+    //Serial.print("Temperature for the device 1 (index 0) is: ");
+    float temp = 0; //Dallas_sensors.getTempCByIndex(0);
+    //Serial.println(temp);
 
     float tempIn = thermocouple.readCelsius();
     Serial.printf("thermo Coupler temp: %.0f\n", tempIn);
@@ -447,8 +457,12 @@ void setup()
         Serial.println("-------------------------------------");
     }
 
-    chargingFunction();
+    //chargingFunction();
 
+    // Disable Serial to save power before deep sleep
+    Serial.println("Preparing for deep sleep...");
+    Serial.flush();
+    
     powerModemDown();
 }
 
