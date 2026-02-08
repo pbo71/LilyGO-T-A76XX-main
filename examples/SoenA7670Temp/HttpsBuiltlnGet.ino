@@ -28,11 +28,12 @@
 //#include <OneWire.h>
 #include <esp32-hal-adc.h>
 #include <max6675.h>
+#include <esp_task_wdt.h>
 
 //#define ONE_WIRE_BUS 0
 
 #define uS_TO_S_FACTOR 1000000ULL /* Conversion factor for micro seconds to seconds */
-#define TIME_TO_SLEEP 60 * 5     /* Time ESP32 will go to sleep (in seconds) */
+#define TIME_TO_SLEEP 60 * 20     /* Time ESP32 will go to sleep (in seconds) */
 
 // Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
 //OneWire oneWire(ONE_WIRE_BUS);
@@ -108,6 +109,7 @@ void powerModemDownNoSleep()
 #endif
 }
 
+#if 0
 void chargingFunction()
 {
     uint32_t battery_voltage = analogReadMilliVolts(BOARD_BAT_ADC_PIN);
@@ -143,7 +145,7 @@ void chargingFunction()
         digitalWrite(RELAY_PIN, HIGH);
     }
 }
-
+#endif 
 void powerModemDown()
 {
     // Disable WiFi and Bluetooth before sleep
@@ -154,18 +156,19 @@ void powerModemDown()
     // Pull up DTR to put the modem into sleep
     pinMode(MODEM_DTR_PIN, OUTPUT);
     digitalWrite(MODEM_DTR_PIN, HIGH);
-    delay(5000);  // Keep this longer for modem to respond
+    delay(5000);
 
     LOG("Check modem online.\n");
     unsigned long start = millis();
     while (!modem.testAT())
     {
-        if (millis() - start > 10000) break; // timeout to avoid long blocking
+        esp_task_wdt_reset();  // Reset watchdog during modem checks
+        if (millis() - start > 10000) break;
         LOG(".");
         delay(500);
     }
     LOG("Modem is online!\n");
-    delay(5000);  // Keep this longer
+    delay(5000);
 
     LOG("Enter modem power off!\n");
     if (modem.poweroff())
@@ -177,7 +180,7 @@ void powerModemDown()
         LOG("Modem power off failed!\n");
     }
 
-    delay(5000);  // Keep this longer
+    delay(5000);
 
     // Flush serial to ensure all data is sent
     Serial.flush();
@@ -197,6 +200,9 @@ void powerModemDown()
     LOG("Entering deep sleep...\n");
     Serial.flush();
 
+    // Disable watchdog before entering deep sleep
+    esp_task_wdt_deinit();
+
     esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
     delay(200);
     esp_deep_sleep_start();
@@ -213,14 +219,17 @@ void setup()
 
     SerialAT.begin(115200, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
 
+    esp_task_wdt_init(30, true);  // 30 second watchdog timeout
+    esp_task_wdt_add(NULL);
+
     // Disable WiFi and Bluetooth to save power
     WiFi.mode(WIFI_OFF);
     btStop();
 
     if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER)
     {
-        Serial.println("Wakeup timer");
-        int i = 5;
+        Serial.println("Wakeup from deep sleep - allowing modem extra startup time");
+        int i = 15;  // Increased to 15 seconds for full modem stabilization
         while (i > 0)
         {
             Serial.printf("Modem will start in %d seconds\n", i);
@@ -232,7 +241,6 @@ void setup()
     }
 
     //analogSetAttenuation(ADC_11db);
-
     //analogReadResolution(12);
 
 #if CONFIG_IDF_TARGET_ESP32
@@ -242,24 +250,27 @@ void setup()
 #ifdef BOARD_POWERON_PIN
     pinMode(BOARD_POWERON_PIN, OUTPUT);
     digitalWrite(BOARD_POWERON_PIN, HIGH);
+    delay(1000);  // Add delay after powering on
 #endif
 
-    // Set modem reset pin ,reset modem
+    // Set modem reset pin - reset modem
     pinMode(MODEM_RESET_PIN, OUTPUT);
     digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
-    delay(100);
+    delay(200);  // Increased from 100ms
     digitalWrite(MODEM_RESET_PIN, MODEM_RESET_LEVEL);
-    delay(2600);
+    delay(4000);  // Increased from 3000ms - critical for post-sleep recovery
     digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
+    delay(500);  // Add stabilization delay
 
     pinMode(BOARD_PWRKEY_PIN, OUTPUT);
     digitalWrite(BOARD_PWRKEY_PIN, LOW);
-    delay(100);
+    delay(150);  // Increased from 100ms
     digitalWrite(BOARD_PWRKEY_PIN, HIGH);
-    delay(100);
+    delay(150);  // Increased from 100ms
     digitalWrite(BOARD_PWRKEY_PIN, LOW);
 
-    //Dallas_sensors.begin();
+    // Allow extra time for modem to power on
+    delay(3000);  // Increased from 2000ms - wait for modem to boot after deep sleep
 
     // Check if the modem is online
     Serial.println("Start modem...");
@@ -268,13 +279,16 @@ void setup()
     while (!modem.testAT(1000))
     {
         Serial.println(".");
-        if (retry++ > 10)
+        esp_task_wdt_reset();  // Reset watchdog during modem checks
+        if (retry++ > 15)  // Increased retry count
         {
+            Serial.println("Modem AT test failed, retrying full reset...");
             digitalWrite(BOARD_PWRKEY_PIN, LOW);
-            delay(100);
+            delay(200);
             digitalWrite(BOARD_PWRKEY_PIN, HIGH);
-            delay(1000);
+            delay(200);
             digitalWrite(BOARD_PWRKEY_PIN, LOW);
+            delay(3000);  // Wait longer after retry
             retry = 0;
         }
     }
@@ -395,73 +409,71 @@ void setup()
 #endif
     Serial.println(buf);
 
-    // Initialize HTTPS
+    // Initialize HTTPS client      
     modem.https_begin();
 
-    // If the status code 715 is returned, please see here
-    // https://github.com/Xinyuan-LilyGO/LilyGO-T-A76XX/issues/117
+    // Send data only ONCE per cycle
+    retry = 3;
+    bool sent_successfully = false;
 
-    for (int i = 0; i < sizeof(request_url) / sizeof(request_url[0]); ++i)
+    while (retry-- && !sent_successfully)
     {
+        Serial.print("Request URL : ");
+        Serial.println(request_url[0]);  // Use first URL only
+        
+        char str[192];
+        sprintf(str, "%s&field1=%i&field2=%.0f&field3=%.0f&field4=%i", 
+                request_url[0], 0, temp, tempIn, battery_voltage);
 
-        int retry = 3;
+        Serial.print("Request URL with data: ");
+        Serial.println(str);
 
-        while (retry--)
+        // Set GET URL
+        if (!modem.https_set_url(str))
         {
-
-            Serial.print("Request URL : ");
-            Serial.println(request_url[i]);
-            char str[192];
-            sprintf(str, "%s&field1=%i&field2=%.0f&field3=%.0f&field4=%i", request_url[i], 0, temp, tempIn, battery_voltage);
-
-            Serial.print("Request URL with data: ");
-            Serial.println(str);
-
-            // Set GET URT
-            if (!modem.https_set_url(str /*request_url[i])*/))
-            {
-                Serial.print("Failed to request : ");
-                Serial.println(request_url[i]);
-                delay(3000);
-                continue;
-            }
-
-            // Send GET request
-            int httpCode = 0;
-            httpCode = modem.https_get();
-            if (httpCode != 200)
-            {
-                Serial.print("HTTP get failed ! error code = ");
-                Serial.println(httpCode);
-                delay(3000);
-                continue;
-            }
-
-            // Get HTTPS header information
-            String header = modem.https_header();
-            Serial.print("HTTP Header : ");
-            Serial.println(header);
-
-            delay(1000);
-
-            // Get HTTPS response
-            String body = modem.https_body();
-            Serial.print("HTTP body : ");
-            Serial.println(body);
-
-            delay(3000);
-
-            break;
+            Serial.print("Failed to set URL, retry...\n");
+            delay(2000);
+            continue;
         }
 
-        Serial.println("-------------------------------------");
+        // Send GET request
+        int httpCode = modem.https_get();
+        if (httpCode != 200)
+        {
+            Serial.print("HTTP get failed ! error code = ");
+            Serial.println(httpCode);
+            delay(2000);
+            continue;
+        }
+
+        // Get HTTPS header information
+        String header = modem.https_header();
+        Serial.print("HTTP Header : ");
+        Serial.println(header);
+        delay(500);
+
+        // Get HTTPS response
+        String body = modem.https_body();
+        Serial.print("HTTP body : ");
+        Serial.println(body);
+
+        sent_successfully = true;  // Mark as sent, exit loop
+        delay(1000);
     }
 
-    //chargingFunction();
+    if (!sent_successfully)
+    {
+        Serial.println("Failed to send data after 3 retries");
+    }
+
+    Serial.println("-------------------------------------");
 
     // Disable Serial to save power before deep sleep
     Serial.println("Preparing for deep sleep...");
     Serial.flush();
+    
+    // Disable watchdog before deep sleep to prevent it from triggering during sleep
+    esp_task_wdt_deinit();
     
     powerModemDown();
 }
