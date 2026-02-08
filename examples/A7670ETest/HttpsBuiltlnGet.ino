@@ -16,17 +16,24 @@
 
 #include "utilities.h"
 #include <TinyGsmClient.h>
-#include <DallasTemperature.h>
-#include <OneWire.h>
-#include <esp32-hal-adc.h>
+#include <WiFi.h>
 #include <max6675.h>
+#include <esp32-hal-adc.h>
 #include <esp_wifi.h>
 #include <esp_bt.h>
 #include "driver/adc.h"
 #include "esp_adc_cal.h"
-#include "WiFi.h"
+#include <esp_task_wdt.h>    // <-- added for watchdog support
+#include "esp_sleep.h"
+#include "esp_system.h"
 
-#define ONE_WIRE_BUS 0
+// debug: set 0 to remove Serial prints to save power
+#define DEBUG 0
+#if DEBUG
+  #define LOG(fmt, ...) Serial.printf(fmt, ##__VA_ARGS__)
+#else
+  #define LOG(fmt, ...)
+#endif
 
 #define uS_TO_S_FACTOR 1000000ULL /* Conversion factor for micro seconds to seconds */
 #define TIME_TO_SLEEP 60 * 20     /* Time ESP32 will go to sleep (in seconds) */
@@ -40,12 +47,11 @@
 #define CHECK_BATTERY_THRESHOLD 3600  // 3.6V in millivolts
 #define DEEP_SLEEP_THRESHOLD 3400     // 3.4V in millivolts
 
-// Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
-OneWire oneWire(ONE_WIRE_BUS);
+// Low battery alert settings
+#define LOW_BATTERY_THRESHOLD 3400  // 3.4V in millivolts
+#define ALERT_PHONE_NUMBER "+4540959135"
 
-// Pass our oneWire reference to Dallas Temperature.
-DallasTemperature Dallas_sensors(&oneWire);
-
+// MAX6675 thermocouple (using only MAX sensor, Dallas/OneWire removed)
 MAX6675 thermocouple(GPIO_NUM_18, BOARD_SD_CS_PIN, GPIO_NUM_19);
 
 #ifdef DUMP_AT_COMMANDS // if enabled it requires the streamDebugger lib
@@ -62,6 +68,9 @@ TinyGsm modem(SerialAT);
 // they will be rejected when registering for the network. You need to ask the local operator for the specific APN.
 // APNs from other operators are welcome to submit PRs for filling.
 #define NETWORK_APN "internet" // CHN-CT: China Telecom
+
+// RTC memory to persist data across deep sleep
+RTC_DATA_ATTR bool low_battery_alert_sent = false;
 
 bool isCharning = false;
 
@@ -117,16 +126,23 @@ void optimizedChargingFunction() {
 
 void powerModemDown()
 {
+    // Disable WiFi and Bluetooth before sleep
+    WiFi.mode(WIFI_OFF);
+    esp_wifi_stop();
+    btStop();
+
     // Pull up DTR to put the modem into sleep
     pinMode(MODEM_DTR_PIN, OUTPUT);
     digitalWrite(MODEM_DTR_PIN, HIGH);
+    delay(5000);
 
-    // Delay sometime ...
-    delay(5000);  // Keep this longer for modem to respond
-
-    Serial.println("Check modem online .");
+    // modem shutdown sequence...
+    LOG("Check modem online .\n");
+    unsigned long start = millis();
     while (!modem.testAT())
     {
+        esp_task_wdt_reset();
+        if (millis() - start > 15000) break; // timeout
         Serial.print(".");
         delay(500);
     }
@@ -148,17 +164,20 @@ void powerModemDown()
     delay(5000);  // Keep this longer
 
     Serial.println("Check modem response .");
+    start = millis();
     while (modem.testAT())
     {
+        esp_task_wdt_reset();
+        if (millis() - start > 15000) break;
         Serial.print(".");
         delay(500);
     }
-    Serial.println("Modem is not respone ,modem has power off !");
+    Serial.println("Modem is not respond, modem has power off !");
 
-    delay(5000);
+    delay(2000);
 
 #ifdef BOARD_POWERON_PIN
-    // Turn on DC boost to power off the modem
+    // Turn off DC boost to power off the modem
     digitalWrite(BOARD_POWERON_PIN, LOW);
 #endif
 
@@ -171,7 +190,14 @@ void powerModemDown()
 
     Serial.println("Enter esp32 goto deepsleep!");
     Serial.flush();
-    
+
+    // remove current task from WDT and deinit the WDT to avoid reset during sleep entry
+    esp_task_wdt_delete(NULL);
+    esp_task_wdt_deinit();
+    delay(50);
+
+    // Enable only timer wakeup and enter deep sleep.
+    // Do NOT call esp_sleep_disable_wakeup_source(...) unless you know that source was enabled.
     esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
     delay(200);
     esp_deep_sleep_start();
@@ -245,16 +271,71 @@ bool setupNetwork(uint8_t maxAttempts = 3) {
     return false;
 }
 
+static const char* resetReasonToStr(esp_reset_reason_t r) {
+    switch (r) {
+        case ESP_RST_UNKNOWN: return "UNKNOWN";
+        case ESP_RST_POWERON: return "POWERON";
+        case ESP_RST_EXT: return "EXTERNAL";
+        case ESP_RST_SW: return "SW_CPU_RESET";
+        case ESP_RST_PANIC: return "PANIC";
+        case ESP_RST_INT_WDT: return "INT_WDT";
+        case ESP_RST_TASK_WDT: return "TASK_WDT";
+        case ESP_RST_WDT: return "WDT";
+        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+        case ESP_RST_BROWNOUT: return "BROWNOUT";
+        case ESP_RST_SDIO: return "SDIO";
+        default: return "OTHER";
+    }
+}
+
+static const char* wakeReasonToStr(esp_sleep_wakeup_cause_t w) {
+    switch (w) {
+        case ESP_SLEEP_WAKEUP_EXT0: return "EXT0";
+        case ESP_SLEEP_WAKEUP_EXT1: return "EXT1";
+        case ESP_SLEEP_WAKEUP_TIMER: return "TIMER";
+        case ESP_SLEEP_WAKEUP_TOUCHPAD: return "TOUCHPAD";
+        case ESP_SLEEP_WAKEUP_ULP: return "ULP";
+        case ESP_SLEEP_WAKEUP_GPIO: return "GPIO";
+        default: return "UNDEFINED";
+    }
+}
+
+static void printResetAndWakeReason() {
+    esp_reset_reason_t rr = esp_reset_reason();
+    Serial.printf("ESP reset reason: %d (%s)\n", (int)rr, resetReasonToStr(rr));
+    esp_sleep_wakeup_cause_t wc = esp_sleep_get_wakeup_cause();
+    Serial.printf("ESP wakeup cause: %d (%s)\n", (int)wc, wakeReasonToStr(wc));
+}
+
+void sendLowBatterySMS() {
+    Serial.println("Sending low battery alert SMS...");
+    
+    char message[128];
+    snprintf(message, sizeof(message), 
+             "Low battery alert! Current voltage: %umV. Device will enter deep sleep.", 
+             analogReadMilliVolts(BOARD_BAT_ADC_PIN) * 2);
+    
+    if (modem.sendSMS(ALERT_PHONE_NUMBER, message)) {
+        Serial.println("SMS sent successfully!");
+        low_battery_alert_sent = true;  // Mark as sent to prevent spam
+    } else {
+        Serial.println("Failed to send SMS");
+    }
+    delay(1000);
+}
+
 void setup()
 {
-    Serial.begin(115200); // Set console baud rate
-    Serial.println("Start Sketch");
+    Serial.begin(115200);
+    delay(50);
+    printResetAndWakeReason();
+
     SerialAT.begin(115200, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
 
     if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER)
     {
         Serial.println("Wakeup timer");
-        int i = 5;
+        int i = 15;
         while (i > 0)
         {
             Serial.printf("Modem will start in %d seconds\n", i);
@@ -288,40 +369,41 @@ void setup()
 #ifdef BOARD_POWERON_PIN
     pinMode(BOARD_POWERON_PIN, OUTPUT);
     digitalWrite(BOARD_POWERON_PIN, HIGH);
+    delay(1000);
 #endif
 
-    // Set modem reset pin ,reset modem
+    // Set modem reset pin
     pinMode(MODEM_RESET_PIN, OUTPUT);
     digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
-    delay(100);
+    delay(200);
     digitalWrite(MODEM_RESET_PIN, MODEM_RESET_LEVEL);
-    delay(2600);
+    delay(3000);
     digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
+    delay(500);
 
     pinMode(BOARD_PWRKEY_PIN, OUTPUT);
     digitalWrite(BOARD_PWRKEY_PIN, LOW);
-    delay(100);
+    delay(150);
     digitalWrite(BOARD_PWRKEY_PIN, HIGH);
-    delay(100);
+    delay(150);
     digitalWrite(BOARD_PWRKEY_PIN, LOW);
 
-    Dallas_sensors.begin();
-
-    // Check if the modem is online
     Serial.println("Start modem...");
 
     int retry = 0;
     while (!modem.testAT(1000))
     {
         Serial.println(".");
-        if (retry++ > 10)
+        if (retry++ > MODEM_INIT_RETRY)
         {
+            Serial.println("Modem not responding, toggling PWRKEY and retrying...");
             digitalWrite(BOARD_PWRKEY_PIN, LOW);
-            delay(100);
+            delay(200);
             digitalWrite(BOARD_PWRKEY_PIN, HIGH);
             delay(1000);
             digitalWrite(BOARD_PWRKEY_PIN, LOW);
             retry = 0;
+            delay(3000);
         }
     }
     Serial.println();
@@ -338,8 +420,6 @@ void setup()
             break;
         case SIM_LOCKED:
             Serial.println("The SIM card is locked. Please unlock the SIM card first.");
-            // const char *SIMCARD_PIN_CODE = "123456";
-            // modem.simUnlock(SIMCARD_PIN_CODE);
             break;
         default:
             break;
@@ -347,7 +427,6 @@ void setup()
         delay(1000);
     }
 
-    // SIM7672G Can't set network mode
 #ifndef TINY_GSM_MODEM_SIM7672
     if (!modem.setNetworkMode(MODEM_NETWORK_AUTO))
     {
@@ -367,7 +446,7 @@ void setup()
     }
 #endif
 
-    // Check network registration status and network signal status
+    // Check network registration
     int16_t sq;
     Serial.print("Wait for the modem to register with the network.");
     RegStatus status = REG_NO_RESULT;
@@ -420,96 +499,111 @@ void setup()
     Serial.print("Network IP:");
     Serial.println(ipAddress);
 
-    Dallas_sensors.requestTemperatures(); // Send the command to get temperatures
-    Serial.print("Temperature for the device 1 (index 0) is: ");
-    float temp = 21; // Dallas_sensors.getTempCByIndex(0);
-    Serial.println(temp);
-
+    // Read MAX6675 thermocouple
     float tempIn = thermocouple.readCelsius();
-    temp = tempIn;
-    Serial.printf("thermo Coupler temp: %.0f\n", tempIn);
+    float temp = tempIn;
+    if (isnan(temp)) {
+        Serial.println("Thermocouple read failed, using fallback");
+        temp = 0.0;
+    }
+    Serial.printf("Thermo Coupler temp: %.1f C\n", temp);
 
+    // Read battery voltage
     uint32_t battery_voltage = analogReadMilliVolts(BOARD_BAT_ADC_PIN);
-    battery_voltage *= 2; // The hardware voltage divider resistor is half of the actual voltage, multiply it by 2 to get the true voltage
+    battery_voltage *= 2;
 
-    char buf[256];
+    // CHECK LOW BATTERY BEFORE SENDING DATA
+    if (battery_voltage < LOW_BATTERY_THRESHOLD && !low_battery_alert_sent) {
+        Serial.printf("Low battery detected: %umV\n", battery_voltage);
+        sendLowBatterySMS();
+        // Skip HTTPS data send when battery is low
+        Serial.println("Skipping data upload due to low battery");
+    } else if (battery_voltage >= LOW_BATTERY_THRESHOLD) {
+        // Reset alert flag if battery recovers above threshold
+        low_battery_alert_sent = false;
+        
+        char buf[256];
 #ifdef BOARD_SOLAR_ADC_PIN_NOT
-    uint32_t solar_voltage = analogReadMilliVolts(BOARD_SOLAR_ADC_PIN);
-    solar_voltage *= 2; // The hardware voltage divider resistor is half of the actual voltage, multiply it by 2 to get the true voltage
-    snprintf(buf, 256, "Battery:%umV \tSolar:%umV", battery_voltage, solar_voltage);
+        uint32_t solar_voltage = analogReadMilliVolts(BOARD_SOLAR_ADC_PIN);
+        solar_voltage *= 2;
+        snprintf(buf, 256, "Battery:%umV \tSolar:%umV", battery_voltage, solar_voltage);
 #else
-    snprintf(buf, 256, "Battery:%umV ", battery_voltage);
+        snprintf(buf, 256, "Battery:%umV ", battery_voltage);
 #endif
-    Serial.println(buf);
+        Serial.println(buf);
 
-    // Initialize HTTPS
-    modem.https_begin();
+        // Initialize HTTPS
+        modem.https_begin();
 
-    // If the status code 715 is returned, please see here
-    // https://github.com/Xinyuan-LilyGO/LilyGO-T-A76XX/issues/117
+        // Send data only ONCE per wake cycle
+        int httpRetry = RETRY_COUNT;
+        bool sent_successfully = false;
 
-    for (int i = 0; i < sizeof(request_url) / sizeof(request_url[0]); ++i)
-    {
-
-        int retry = 3;
-
-        while (retry--)
+        while (httpRetry-- && !sent_successfully)
         {
-
             Serial.print("Request URL : ");
-            Serial.println(request_url[i]);
-            char str[192];
-            sprintf(str, "%s&field1=%i&field2=%i&field3=%.0f&field4=%.0f", request_url[i], battery_voltage, solar_voltage, temp, tempIn);
+            Serial.println(request_url[0]);
+
+            char str[MAX_URL_LENGTH];
+#ifdef BOARD_SOLAR_ADC_PIN_NOT
+            uint32_t solar_voltage = analogReadMilliVolts(BOARD_SOLAR_ADC_PIN) * VOLTAGE_MULTIPLIER;
+            snprintf(str, MAX_URL_LENGTH, "%s&field1=%i&field2=%i&field3=%.0f&field4=%.0f", request_url[0], battery_voltage, solar_voltage, temp, tempIn);
+#else
+            snprintf(str, MAX_URL_LENGTH, "%s&field1=%i&field2=%.0f&field3=%.0f", request_url[0], battery_voltage, temp, tempIn);
+#endif
 
             Serial.print("Request URL with data: ");
             Serial.println(str);
 
-            // Set GET URT
-            if (!modem.https_set_url(str /*request_url[i])*/))
+            if (!modem.https_set_url(str))
             {
-                Serial.print("Failed to request : ");
-                Serial.println(request_url[i]);
-                delay(3000);
+                Serial.println("Failed to set URL, retrying...");
+                delay(2000);
                 continue;
             }
 
-            // Send GET request
-            int httpCode = 0;
-            httpCode = modem.https_get();
+            int httpCode = modem.https_get();
             if (httpCode != 200)
             {
                 Serial.print("HTTP get failed ! error code = ");
                 Serial.println(httpCode);
-                delay(3000);
+                delay(2000);
                 continue;
             }
 
-            // Get HTTPS header information
             String header = modem.https_header();
             Serial.print("HTTP Header : ");
             Serial.println(header);
+            delay(500);
 
-            delay(1000);
-
-            // Get HTTPS response
             String body = modem.https_body();
             Serial.print("HTTP body : ");
             Serial.println(body);
 
-            delay(3000);
-
-            break;
+            sent_successfully = true;
+            delay(1000);
         }
 
-        Serial.println("-------------------------------------");
+        if (!sent_successfully) {
+            Serial.println("Failed to send data after retries");
+        }
     }
+
+    Serial.println("-------------------------------------");
+
+    // ensure watchdog disabled before entering deep sleep
+    Serial.println("Preparing for deep sleep...");
+    Serial.flush();
+
+    // Disable watchdog before deep sleep to avoid wake race conditions
+    esp_task_wdt_deinit();
 
     powerModemDown();
 }
 
 void loop()
 {
-    // Debug AT
+    // Debug AT passthrough
     if (SerialAT.available())
     {
         Serial.write(SerialAT.read());
@@ -521,59 +615,11 @@ void loop()
     delay(1);
 }
 
-// Add this function to handle sleep mode
-void enterSleepMode(uint32_t battery_voltage) {
-    if (battery_voltage < DEEP_SLEEP_THRESHOLD) {
-        Serial.println("Battery low, entering deep sleep...");
-        
-        // Properly handle Dallas temperature sensor
-        Dallas_sensors.setResolution(9);  // Set lowest resolution to save power
-        Dallas_sensors.requestTemperatures();  // Complete any pending operations
-        
-        // Power down other peripherals
-        digitalWrite(BOARD_PWRKEY_PIN, LOW);
-        
-        // Enter deep sleep for longer duration
-        esp_sleep_enable_timer_wakeup(SLEEP_DURATION_MINUTES * 2 * 60 * uS_TO_S_FACTOR);
-    } else {
-        Serial.println("Entering normal sleep cycle...");
-        esp_sleep_enable_timer_wakeup(SLEEP_DURATION_MINUTES * 60 * uS_TO_S_FACTOR);
-    }
-    
-    // Configure GPIO pins for sleep
-    gpio_deep_sleep_hold_en();
-    
-    Serial.println("Entering deep sleep...");
-    Serial.flush();
-    
-    esp_deep_sleep_start();
-}
-
 // Add this function for modem power optimization
 void optimizeModemPower() {
-    // Disable unnecessary modem features
-    modem.sendAT("+CFUN=0");  // Minimum functionality
-    modem.sendAT("+CSCLK=2"); // Enable deep sleep mode
-    
-    // Only enable full functionality when needed
-    modem.sendAT("+CFUN=1");
-    // Wait for network registration
-    delay(2000);
-}
-
-// Add this function for efficient sensor reading
-bool readSensorsWithTimeout() {
-    unsigned long timeout = millis();
-    const unsigned long SENSOR_TIMEOUT = 1000; // 1 second timeout
-    
-    Dallas_sensors.requestTemperatures();
-    while (!Dallas_sensors.isConversionComplete()) {
-        if (millis() - timeout > SENSOR_TIMEOUT) {
-            return false;
-        }
-        delay(10);
-    }
-    return true;
+    // Try to reduce modem activity when not needed
+    modem.sendAT("+CSCLK=2"); // enable modem sleep
+    delay(200);
 }
 
 // Add this function for handling connection failures
