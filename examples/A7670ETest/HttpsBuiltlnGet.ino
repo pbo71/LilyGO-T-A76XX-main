@@ -54,10 +54,11 @@
 
 // OTA Update settings
 #define OTA_MINIMUM_VOLTAGE 3800      // 3.8V minimum for safe OTA update
-#define CURRENT_FIRMWARE_VERSION 1    // Increment this when you release new firmware
-// GitHub "latest" URLs automatically point to newest release
-#define OTA_FIRMWARE_URL "https://github.com/pbo71/LilyGO-T-A76XX-main/releases/latest/download/firmware.bin"
-#define OTA_VERSION_URL "https://github.com/pbo71/LilyGO-T-A76XX-main/releases/latest/download/version.txt"
+#define CURRENT_FIRMWARE_VERSION 2    // Increment this when you release new firmware
+// Direct URLs (modem doesn't handle GitHub's /latest/ redirect)
+// Points to v2.0.0 to verify it's up-to-date. Change to v2.0.0 URLs when ready to deploy v2.
+#define OTA_FIRMWARE_URL "https://github.com/pbo71/LilyGO-T-A76XX-main/releases/download/v2.0.0/firmware.bin"
+#define OTA_VERSION_URL "https://github.com/pbo71/LilyGO-T-A76XX-main/releases/download/v2.0.0/version.txt"
 
 // Low battery alert settings
 #define LOW_BATTERY_THRESHOLD 3600  // 3.6V in millivolts - alert earlier for recharge time
@@ -1053,9 +1054,12 @@ void setup()
             
             if (checkForOTAUpdate()) {
                 // New firmware available - perform update
+                Serial.println("Starting OTA update process...");
                 performOTAUpdate();
                 // If we return here, update failed - continue normally
                 Serial.println("OTA update failed, continuing with normal operation");
+            } else {
+                Serial.println("No OTA update available or check failed (this is normal if no release exists yet)");
             }
         } else if (should_check_ota) {
             Serial.printf("Skipping OTA check - battery too low: %umV (need %umV)\n", 
