@@ -51,14 +51,15 @@
 #define CHECK_BATTERY_THRESHOLD 3600  // 3.6V in millivolts
 #define DEEP_SLEEP_THRESHOLD 3500     // 3.5V in millivolts - critical battery protection
 #define MINIMUM_MODEM_VOLTAGE 4000    // 4.0V minimum for reliable modem startup
+#define NO_BATTERY_VOLTAGE 1000       // Below this = no battery, running on USB only
 
 // OTA Update settings
 #define OTA_MINIMUM_VOLTAGE 3800      // 3.8V minimum for safe OTA update
 #define CURRENT_FIRMWARE_VERSION 2    // Increment this when you release new firmware
-// Direct URLs (modem doesn't handle GitHub's /latest/ redirect)
-// Points to v2.0.0 to verify it's up-to-date. Change to v2.0.0 URLs when ready to deploy v2.
-#define OTA_FIRMWARE_URL "https://github.com/pbo71/LilyGO-T-A76XX-main/releases/download/v2.0.0/firmware.bin"
-#define OTA_VERSION_URL "https://github.com/pbo71/LilyGO-T-A76XX-main/releases/download/v2.0.0/version.txt"
+// Using raw.githubusercontent.com URLs (no redirects - modem can handle these!)
+// Files must be committed to the repository at firmware/version.txt and firmware/firmware.bin
+#define OTA_FIRMWARE_URL "https://raw.githubusercontent.com/pbo71/LilyGO-T-A76XX-main/main/firmware/firmware.bin"
+#define OTA_VERSION_URL "https://raw.githubusercontent.com/pbo71/LilyGO-T-A76XX-main/main/firmware/version.txt"
 
 // Low battery alert settings
 #define LOW_BATTERY_THRESHOLD 3600  // 3.6V in millivolts - alert earlier for recharge time
@@ -543,16 +544,74 @@ void optimizeModemPower() {
     delay(200);
 }
 
+bool configureSSLForOTA() {
+    Serial.println("Configuring SSL for HTTPS...");
+    
+    // Configure SSL context 0 for HTTPS
+    // Set SSL/TLS version to TLS 1.2 (value 4)
+    modem.sendAT("+CSSLCFG=\"sslversion\",0,4");
+    if (modem.waitResponse(3000) != 1) {
+        Serial.println("Failed to set SSL version");
+        return false;
+    }
+    
+    // Set authentication mode to 0 (no certificate validation)
+    // For production, consider using mode 1 with proper CA certificates
+    modem.sendAT("+CSSLCFG=\"authmode\",0,0");
+    if (modem.waitResponse(3000) != 1) {
+        Serial.println("Failed to set auth mode");
+        return false;
+    }
+    
+    // Enable SNI (Server Name Indication) for GitHub
+    modem.sendAT("+CSSLCFG=\"enableSNI\",0,1");
+    if (modem.waitResponse(3000) != 1) {
+        Serial.println("Failed to enable SNI");
+        return false;
+    }
+    
+    // Set SSL context for HTTP client
+    if (!modem.https_set_ssl_index(0)) {
+        Serial.println("Failed to set SSL index");
+        return false;
+    }
+    
+    Serial.println("SSL configuration complete");
+    return true;
+}
+
 bool checkForOTAUpdate() {
     Serial.println("Checking for firmware updates...");
     
+    // Close existing HTTPS session from ThingSpeak
+    Serial.println("Closing previous HTTPS session...");
+    modem.https_end();
+    delay(1000);
+    
+    // Initialize new HTTPS session
+    Serial.println("Starting new HTTPS session...");
+    if (!modem.https_begin()) {
+        Serial.println("Failed to initialize HTTPS");
+        return false;
+    }
+    
+    // Note: Not using SSL config - modem handles HTTPS automatically
+    // ThingSpeak works without explicit SSL config, so GitHub should too
+    
     // Check version from server
+    Serial.println("Setting version check URL...");
+    Serial.print("URL: ");
+    Serial.println(OTA_VERSION_URL);
     if (!modem.https_set_url(OTA_VERSION_URL)) {
         Serial.println("Failed to set version check URL");
         return false;
     }
     
+    Serial.println("Sending HTTPS GET request...");
+    delay(500);
+    
     int httpCode = modem.https_get();
+    Serial.printf("HTTPS GET returned code: %d\n", httpCode);
     if (httpCode != 200) {
         Serial.printf("Version check failed, HTTP code: %d\n", httpCode);
         return false;
@@ -717,13 +776,24 @@ void setup()
         if (!shouldReportNow()) {
             uint32_t sec = secondsUntilHour(6);
             Serial.printf("Quiet hours detected - sleeping %u seconds until 06:00\n", sec);
+            
+            // Invalidate time sync so we re-sync after waking from long sleep
+            // This prevents getting stuck in quiet hours loop due to incorrect time estimation
+            last_synced_time = 0;
+            wakes_since_sync = 0;
+            
             esp_sleep_enable_timer_wakeup((uint64_t)sec * uS_TO_S_FACTOR);
             esp_deep_sleep_start();
         }
     }
 
     // Check if battery is too low for modem startup
-    if (battery_voltage < MINIMUM_MODEM_VOLTAGE) {
+    // Skip this check if no battery is detected (USB-only power)
+    bool usb_only = (battery_voltage < NO_BATTERY_VOLTAGE);
+    if (usb_only) {
+        Serial.println("No battery detected - running on USB power only");
+        battery_voltage = 4200;  // Use nominal value so battery checks pass
+    } else if (battery_voltage < MINIMUM_MODEM_VOLTAGE) {
         Serial.printf("Battery too low (%umV) for modem startup. Entering long sleep...\n", battery_voltage);
         // Sleep for 2 hours to allow charging/recovery
         esp_sleep_enable_timer_wakeup(2 * 60 * 60 * uS_TO_S_FACTOR);
@@ -1065,6 +1135,9 @@ void setup()
             Serial.printf("Skipping OTA check - battery too low: %umV (need %umV)\n", 
                          battery_voltage, OTA_MINIMUM_VOLTAGE);
         }
+        
+        // Close HTTPS session after all network operations
+        modem.https_end();
     }
 
     Serial.println("-------------------------------------");
