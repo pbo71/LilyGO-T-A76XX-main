@@ -54,7 +54,6 @@
 #define SerialAT Serial1
 
 #define MODEM_GPS_ENABLE_GPIO (-1)
-#define RELAY_PIN (32)
 
 #ifndef TINY_GSM_MODEM_A7670
 #define TINY_GSM_MODEM_A7670

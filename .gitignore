@@ -4,3 +4,4 @@ test
 script
 build
 extars
+examples/A7670ETest/secrets.h

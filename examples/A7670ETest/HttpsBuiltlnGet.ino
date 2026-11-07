@@ -15,18 +15,18 @@
 // #define DUMP_AT_COMMANDS
 
 #include "utilities.h"
+#include "secrets.h"  // ALERT_PHONE_NUMBER and THINGSPEAK_API_KEY, not in git (see secrets.h.example)
 #include <TinyGsmClient.h>
 #include <WiFi.h>
 #include <max6675.h>
 #include <esp32-hal-adc.h>
-#include <Update.h>
 #include <esp_wifi.h>
 #include <esp_bt.h>
 #include "driver/adc.h"
 #include "esp_adc_cal.h"
 #include <esp_task_wdt.h>    // <-- added for watchdog support
+#include <esp_arduino_version.h>
 #include "esp_sleep.h"
-#include "esp_system.h"
 #include <time.h>
 #include <sys/time.h>
 #include "lwip/apps/sntp.h"
@@ -46,24 +46,19 @@
 #define RETRY_COUNT 3
 #define MAX_URL_LENGTH 192
 #define VOLTAGE_MULTIPLIER 2
+#define SIM_READY_TIMEOUT_MS 60000UL      // Give up waiting for the SIM after 1 minute
+#define NETWORK_REG_TIMEOUT_MS 180000UL   // Give up network registration after 3 minutes
 #define MODEM_INIT_RETRY 10
 #define SLEEP_DURATION_MINUTES 20
 #define CHECK_BATTERY_THRESHOLD 3600  // 3.6V in millivolts
 #define DEEP_SLEEP_THRESHOLD 3500     // 3.5V in millivolts - critical battery protection
-#define MINIMUM_MODEM_VOLTAGE 4000    // 4.0V minimum for reliable modem startup
+#define MINIMUM_MODEM_VOLTAGE 3900    // 3.9V minimum for reliable modem startup
 #define NO_BATTERY_VOLTAGE 1000       // Below this = no battery, running on USB only
 
-// OTA Update settings
-#define OTA_MINIMUM_VOLTAGE 3800      // 3.8V minimum for safe OTA update
-#define CURRENT_FIRMWARE_VERSION 2    // Increment this when you release new firmware
-// Using raw.githubusercontent.com URLs (no redirects - modem can handle these!)
-// Files must be committed to the repository at firmware/version.txt and firmware/firmware.bin
-#define OTA_FIRMWARE_URL "https://raw.githubusercontent.com/pbo71/LilyGO-T-A76XX-main/main/firmware/firmware.bin"
-#define OTA_VERSION_URL "https://raw.githubusercontent.com/pbo71/LilyGO-T-A76XX-main/main/firmware/version.txt"
-
 // Low battery alert settings
-#define LOW_BATTERY_THRESHOLD 3600  // 3.6V in millivolts - alert earlier for recharge time
-#define ALERT_PHONE_NUMBER "+4540959135"
+// Must stay above MINIMUM_MODEM_VOLTAGE: below that the modem is never started, so no SMS can be sent
+#define LOW_BATTERY_THRESHOLD 4000        // 4.0V in millivolts - send the SMS below this
+#define LOW_BATTERY_RESET_THRESHOLD 4100  // 4.1V in millivolts - allow a new SMS once recovered
 
 // MAX6675 thermocouple (using only MAX sensor, Dallas/OneWire removed)
 MAX6675 thermocouple(GPIO_NUM_18, BOARD_SD_CS_PIN, GPIO_NUM_19);
@@ -84,34 +79,16 @@ TinyGsm modem(SerialAT);
 #define NETWORK_APN "internet" // CHN-CT: China Telecom
 
 // RTC memory to persist data across deep sleep
-RTC_DATA_ATTR bool low_battery_alert_sent = false;
 RTC_DATA_ATTR uint32_t cycle_count = 0;
 RTC_DATA_ATTR uint32_t total_mah_used = 0;
 RTC_DATA_ATTR uint32_t startup_voltage = 0;
-RTC_DATA_ATTR time_t last_synced_time = 0;
-RTC_DATA_ATTR uint32_t wakes_since_sync = 0;
 RTC_DATA_ATTR bool modem_initialized = false;
-RTC_DATA_ATTR uint32_t last_ota_check_time = 0;  // Track when we last checked for updates
-
-bool isCharning = false;
+RTC_DATA_ATTR bool low_battery_alert_sent = false;
 
 const char *request_url[] = {
-    "https://api.thingspeak.com/update?api_key=04T1JJYY542SD2GL"};
+    "https://api.thingspeak.com/update?api_key=" THINGSPEAK_API_KEY};
 
 // Time & quiet-hours helpers
-void estimateCurrentTime()
-{
-    if (last_synced_time > 1600000000) {
-        // Each wake cycle is TIME_TO_SLEEP seconds apart
-        uint32_t elapsed_sec = wakes_since_sync * TIME_TO_SLEEP;
-        time_t estimated = last_synced_time + elapsed_sec;
-        struct timeval tv = { .tv_sec = estimated, .tv_usec = 0 };
-        settimeofday(&tv, NULL);
-        Serial.printf("Estimated time from RTC: %lu (wakes: %u)\n", estimated, wakes_since_sync);
-        wakes_since_sync++;  // Increment for next cycle
-    }
-}
-
 bool haveValidTime()
 {
     time_t now = time(NULL);
@@ -147,7 +124,7 @@ time_t parseHTTPDate(String dateStr)
     char dayname[10];
     
     // Try with day name first: "Sun, 16 Feb 2026 19:01:43 GMT"
-    int matched = sscanf(dateLine.c_str(), "%[^,], %d %3s %d %d:%d:%d", 
+    int matched = sscanf(dateLine.c_str(), "%9[^,], %d %3s %d %d:%d:%d", 
                          dayname, &day, month_str, &year, &hour, &min, &sec);
     
     // If that fails, try without day name: "16 Feb 2026 19:01:43 GMT"
@@ -198,8 +175,6 @@ void syncTimeFromHTTP(String httpHeader)
         struct timeval tv = { .tv_sec = http_time, .tv_usec = 0 };
         settimeofday(&tv, NULL);
         
-        last_synced_time = http_time;
-        wakes_since_sync = 0;  // Reset counter after successful sync
         
         struct tm timeinfo;
         localtime_r(&http_time, &timeinfo);
@@ -236,51 +211,20 @@ bool shouldReportNow()
     return !(hour >= 0 && hour < 6);
 }
 
-void chargingFunction()
+void sendLowBatterySMS(uint32_t voltage)
 {
-    uint32_t battery_voltage = analogReadMilliVolts(BOARD_BAT_ADC_PIN);
-    battery_voltage *= 2; // The hardware voltage divider resistor is half of the actual voltage, multiply it by 2 to get the true voltage
+    char message[100];
+    // ASCII only: the SMS is sent in the GSM character set
+    snprintf(message, sizeof(message), "Lavt batteri: %umV. Enheden stopper under %umV. Oplad snart.",
+             voltage, (uint32_t)MINIMUM_MODEM_VOLTAGE);
 
-    Serial.print("Check Charging - battery voltage = ");
-    Serial.println(battery_voltage);
-
-    if (battery_voltage >= 4200)
-    {
-        Serial.println("Stop Charging battery ....");
-        digitalWrite(RELAY_PIN, HIGH); // Stop charging
-        delay(1000);
-        digitalWrite(RELAY_PIN, HIGH);
-        isCharning = false;
+    Serial.println("Sending low battery SMS...");
+    if (modem.sendSMS(ALERT_PHONE_NUMBER, message)) {
+        Serial.println("Low battery SMS sent");
+        low_battery_alert_sent = true;  // Only one SMS until the battery has recovered
+    } else {
+        Serial.println("Low battery SMS failed, will retry next cycle");
     }
-    else
-    {
-        Serial.println("Start Charging battery ....");
-        pinMode(RELAY_PIN, OUTPUT);
-        digitalWrite(RELAY_PIN, HIGH);
-        delay(500);
-        digitalWrite(RELAY_PIN, LOW); // Start charging
-        Serial.println("RELAY PIN High");
-        delay(500);
-        digitalWrite(RELAY_PIN, HIGH);
-        isCharning = true;
-    }
-}
-
-// Improve the existing charging function
-void optimizedChargingFunction() {
-    uint32_t battery_voltage = analogReadMilliVolts(BOARD_BAT_ADC_PIN) * 2;
-    
-    static const uint32_t CHARGING_START_THRESHOLD = 3800;  // 3.8V
-    static const uint32_t CHARGING_STOP_THRESHOLD = 4200;   // 4.2V
-    
-    if (battery_voltage >= CHARGING_STOP_THRESHOLD) {
-        digitalWrite(RELAY_PIN, HIGH);  // Stop charging
-        isCharning = false;
-    } else if (battery_voltage < CHARGING_START_THRESHOLD) {
-        digitalWrite(RELAY_PIN, LOW);   // Start charging
-        isCharning = true;
-    }
-    // No change if voltage is between thresholds (hysteresis)
 }
 
 void powerModemDown()
@@ -478,23 +422,6 @@ static void printResetAndWakeReason() {
     Serial.printf("ESP wakeup cause: %d (%s)\n", (int)wc, wakeReasonToStr(wc));
 }
 
-void sendLowBatterySMS() {
-    Serial.println("Sending low battery alert SMS...");
-    
-    char message[128];
-    snprintf(message, sizeof(message), 
-             "Low battery alert! Current voltage: %umV. Device will enter deep sleep.", 
-             analogReadMilliVolts(BOARD_BAT_ADC_PIN) * 2);
-    
-    if (modem.sendSMS(ALERT_PHONE_NUMBER, message)) {
-        Serial.println("SMS sent successfully!");
-        low_battery_alert_sent = true;  // Mark as sent to prevent spam
-    } else {
-        Serial.println("Failed to send SMS");
-    }
-    delay(1000);
-}
-
 // Check if this is a cold start (powered via USB without battery)
 bool isColdStart() {
     esp_reset_reason_t reason = esp_reset_reason();
@@ -511,7 +438,8 @@ void logPowerConsumption(uint32_t current_voltage, uint32_t previous_voltage) {
     // Rough estimation: voltage drop correlates to mAh used
     // LiPo discharge curve: ~3.7V nominal, usable 3.0V-4.2V = 1.2V range
     // Simplified: ~4 mAh per 1mV drop (varies by battery chemistry)
-    uint32_t voltage_drop = previous_voltage - current_voltage;
+    // Voltage can rise between cycles (charging, ADC noise), so avoid unsigned wraparound
+    uint32_t voltage_drop = (previous_voltage > current_voltage) ? previous_voltage - current_voltage : 0;
     uint32_t estimated_mah = voltage_drop * 4 / 100;  // mAh estimate
     
     if (voltage_drop > 0) {
@@ -526,9 +454,9 @@ void logPowerConsumption(uint32_t current_voltage, uint32_t previous_voltage) {
         Serial.printf("Current voltage: %umV\n", current_voltage);
         
         // Estimate remaining runtime
-        uint32_t remaining_mah = (current_voltage - 3400) * 4 / 100;  // down to 3.4V cutoff
+        uint32_t remaining_mah = (current_voltage > 3400) ? (current_voltage - 3400) * 4 / 100 : 0;  // down to 3.4V cutoff
         uint32_t avg_mah_per_cycle = total_mah_used / cycle_count;
-        uint32_t estimated_cycles_remaining = (remaining_mah > 0) ? remaining_mah / avg_mah_per_cycle : 0;
+        uint32_t estimated_cycles_remaining = (avg_mah_per_cycle > 0) ? remaining_mah / avg_mah_per_cycle : 0;
         uint32_t estimated_hours_remaining = (estimated_cycles_remaining * 20) / 60;
         
         Serial.printf("Avg mAh per cycle: %umAh\n", avg_mah_per_cycle);
@@ -578,137 +506,6 @@ bool configureSSLForOTA() {
     
     Serial.println("SSL configuration complete");
     return true;
-}
-
-bool checkForOTAUpdate() {
-    Serial.println("Checking for firmware updates...");
-    
-    // Close existing HTTPS session from ThingSpeak
-    Serial.println("Closing previous HTTPS session...");
-    modem.https_end();
-    delay(1000);
-    
-    // Initialize new HTTPS session
-    Serial.println("Starting new HTTPS session...");
-    if (!modem.https_begin()) {
-        Serial.println("Failed to initialize HTTPS");
-        return false;
-    }
-    
-    // Note: Not using SSL config - modem handles HTTPS automatically
-    // ThingSpeak works without explicit SSL config, so GitHub should too
-    
-    // Check version from server
-    Serial.println("Setting version check URL...");
-    Serial.print("URL: ");
-    Serial.println(OTA_VERSION_URL);
-    if (!modem.https_set_url(OTA_VERSION_URL)) {
-        Serial.println("Failed to set version check URL");
-        return false;
-    }
-    
-    Serial.println("Sending HTTPS GET request...");
-    delay(500);
-    
-    int httpCode = modem.https_get();
-    Serial.printf("HTTPS GET returned code: %d\n", httpCode);
-    if (httpCode != 200) {
-        Serial.printf("Version check failed, HTTP code: %d\n", httpCode);
-        return false;
-    }
-    
-    String versionStr = modem.https_body();
-    versionStr.trim();
-    int serverVersion = versionStr.toInt();
-    
-    Serial.printf("Current version: %d, Server version: %d\n", CURRENT_FIRMWARE_VERSION, serverVersion);
-    
-    if (serverVersion > CURRENT_FIRMWARE_VERSION) {
-        Serial.println("New firmware available!");
-        return true;
-    }
-    
-    Serial.println("Firmware is up to date");
-    return false;
-}
-
-bool performOTAUpdate() {
-    Serial.println("=== Starting OTA Update ===");
-    
-    // Set firmware URL
-    if (!modem.https_set_url(OTA_FIRMWARE_URL)) {
-        Serial.println("Failed to set firmware URL");
-        return false;
-    }
-    
-    // Download firmware
-    Serial.println("Downloading firmware...");
-    int httpCode = modem.https_get();
-    if (httpCode != 200) {
-        Serial.printf("Firmware download failed, HTTP code: %d\n", httpCode);
-        return false;
-    }
-    
-    // Get firmware size
-    size_t firmware_size = modem.https_get_size();
-    Serial.printf("Firmware size: %d bytes\n", firmware_size);
-    
-    if (firmware_size == 0 || firmware_size > 2000000) {  // Max 2MB sanity check
-        Serial.println("Invalid firmware size");
-        return false;
-    }
-    
-    // Begin update
-    if (!Update.begin(firmware_size)) {
-        Serial.println("Not enough space for OTA update");
-        return false;
-    }
-    
-    // Download and write firmware
-    uint8_t buffer[1024];
-    int written = 0;
-    int progress = 0;
-    int total = 0;
-    
-    Serial.println("Writing firmware...");
-    while (1) {
-        esp_task_wdt_reset();  // Keep watchdog happy during long operation
-        
-        int len = modem.https_body(buffer, 1024);
-        if (len == 0) break;
-        
-        written = Update.write(buffer, len);
-        if (written != len) {
-            Serial.printf("Write error: %d/%d bytes\n", written, len);
-            Update.abort();
-            return false;
-        }
-        
-        total += written;
-        int newProgress = (total * 100) / firmware_size;
-        if (newProgress - progress >= 10 || newProgress == 100) {
-            progress = newProgress;
-            Serial.printf("Progress: %d%%\n", progress);
-        }
-    }
-    
-    // Finalize update
-    if (!Update.end()) {
-        Serial.printf("Update failed, error #%d\n", Update.getError());
-        return false;
-    }
-    
-    if (!Update.isFinished()) {
-        Serial.println("Update not finished");
-        return false;
-    }
-    
-    Serial.println("=== OTA Update Successful ===");
-    Serial.println("Rebooting in 3 seconds...");
-    delay(3000);
-    
-    esp_restart();
-    return true;  // Never reached
 }
 
 void disableWiFiAndBT() {
@@ -768,19 +565,11 @@ void setup()
     // Store current voltage for next cycle comparison
     startup_voltage = battery_voltage;
 
-    // Estimate current time from last sync (if available)
-    estimateCurrentTime();
-
     // If we have valid time and it's quiet hours (00:00-06:00), sleep until 06:00
     if (haveValidTime()) {
         if (!shouldReportNow()) {
             uint32_t sec = secondsUntilHour(6);
             Serial.printf("Quiet hours detected - sleeping %u seconds until 06:00\n", sec);
-            
-            // Invalidate time sync so we re-sync after waking from long sleep
-            // This prevents getting stuck in quiet hours loop due to incorrect time estimation
-            last_synced_time = 0;
-            wakes_since_sync = 0;
             
             esp_sleep_enable_timer_wakeup((uint64_t)sec * uS_TO_S_FACTOR);
             esp_deep_sleep_start();
@@ -817,9 +606,27 @@ void setup()
     SerialAT.begin(115200, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
 
     // Initialize watchdog timer to prevent hangs during modem startup
-    esp_task_wdt_init(120, true);  // 120 second timeout with panic on timeout
-    esp_task_wdt_add(NULL);       // Add current task to watchdog
-    Serial.println("Watchdog timer initialized (120s timeout)");
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    esp_task_wdt_config_t wdt_config = {};
+    wdt_config.timeout_ms = 120000;
+    wdt_config.idle_core_mask = 0;
+    wdt_config.trigger_panic = true;
+    esp_err_t wdt_result = esp_task_wdt_reconfigure(&wdt_config);
+    if (wdt_result == ESP_ERR_INVALID_STATE) {
+        wdt_result = esp_task_wdt_init(&wdt_config);
+    }
+#else
+    esp_err_t wdt_result = esp_task_wdt_init(120, true);
+#endif
+    if (wdt_result != ESP_OK) {
+        Serial.printf("Watchdog configuration failed: %d\n", wdt_result);
+    }
+
+    wdt_result = esp_task_wdt_add(NULL);
+    if (wdt_result != ESP_OK && wdt_result != ESP_ERR_INVALID_STATE) {
+        Serial.printf("Watchdog task registration failed: %d\n", wdt_result);
+    }
+    Serial.println("Watchdog configured (120s timeout)");
 
     if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER)
     {
@@ -837,13 +644,12 @@ void setup()
 
     // Configure ADC for power saving
     analogSetPinAttenuation(BOARD_BAT_ADC_PIN, ADC_11db);
+#if ESP_ARDUINO_VERSION_MAJOR < 3
     analogSetClockDiv(255);
+#endif
     
     // Disable WiFi and Bluetooth
     disableWiFiAndBT();
-    
-    // Use optimized charging
-    optimizedChargingFunction();
     
     // Optimize modem power
     optimizeModemPower();
@@ -882,6 +688,10 @@ void setup()
     // Do full initialization if fast wake wasn't attempted or failed
     if (!fast_wake_attempted) {
         Serial.println("Full modem initialization...");
+        // Release the reset pin hold set before deep sleep, otherwise the pulse below has no effect
+        gpio_hold_dis((gpio_num_t)MODEM_RESET_PIN);
+        gpio_deep_sleep_hold_dis();
+
         // Set modem reset pin with longer stabilization
         pinMode(MODEM_RESET_PIN, OUTPUT);
         digitalWrite(MODEM_RESET_PIN, !MODEM_RESET_LEVEL);
@@ -927,9 +737,16 @@ void setup()
 
     // Check if SIM card is online
     SimStatus sim = SIM_ERROR;
+    unsigned long sim_wait_start = millis();
     while (sim != SIM_READY)
     {
         esp_task_wdt_reset();  // Reset watchdog during SIM checks
+        if (millis() - sim_wait_start > SIM_READY_TIMEOUT_MS)
+        {
+            Serial.println("SIM card not ready before timeout. Powering down until next cycle...");
+            modem_initialized = false;  // Do a full init on next wake
+            powerModemDown();
+        }
         sim = modem.getSimStatus();
         switch (sim)
         {
@@ -968,9 +785,16 @@ void setup()
     int16_t sq;
     Serial.print("Wait for the modem to register with the network.");
     RegStatus status = REG_NO_RESULT;
+    unsigned long reg_wait_start = millis();
     while (status == REG_NO_RESULT || status == REG_SEARCHING || status == REG_UNREGISTERED)
     {
         esp_task_wdt_reset();  // Reset watchdog during network registration
+        if (millis() - reg_wait_start > NETWORK_REG_TIMEOUT_MS)
+        {
+            Serial.println("Network registration timed out. Powering down until next cycle...");
+            modem_initialized = false;  // Do a full init on next wake
+            powerModemDown();
+        }
         status = modem.getRegistrationStatus();
         switch (status)
         {
@@ -982,7 +806,9 @@ void setup()
             break;
         case REG_DENIED:
             Serial.println("Network registration was rejected, please check if the APN is correct");
-            return;
+            modem_initialized = false;  // Do a full init on next wake
+            powerModemDown();  // Does not return: enters deep sleep
+            break;
         case REG_OK_HOME:
             Serial.println("Online registration successful");
             break;
@@ -1028,125 +854,94 @@ void setup()
 #endif
     Serial.println(buf);
 
-    // CHECK LOW BATTERY AND SEND SMS ONLY AFTER NETWORK IS READY
+    // Network is registered, so the SMS can go out here
     if (battery_voltage < LOW_BATTERY_THRESHOLD && !low_battery_alert_sent) {
-        Serial.printf("Low battery detected: %umV\n", battery_voltage);
-        // Network is now ready, safe to send SMS
-        sendLowBatterySMS();
-        Serial.println("Skipping data upload due to low battery");
-    } else if (battery_voltage >= LOW_BATTERY_THRESHOLD) {
-        // Reset alert flag if battery recovers
+        esp_task_wdt_reset();  // Sending an SMS can take a while
+        sendLowBatterySMS(battery_voltage);
+    } else if (battery_voltage >= LOW_BATTERY_RESET_THRESHOLD) {
         low_battery_alert_sent = false;
+    }
 
-        // Read MAX6675 thermocouple ONLY when we're about to transmit (saves power)
-        float tempIn = thermocouple.readCelsius();
-        float temp = tempIn;
-        if (isnan(temp)) {
-            Serial.println("Thermocouple read failed, using fallback");
-            temp = 0.0;
-        }
-        Serial.printf("Thermo Coupler temp: %.1f C\n", temp);
+    // Read MAX6675 thermocouple ONLY when we're about to transmit (saves power)
+    float tempIn = thermocouple.readCelsius();
+    float temp = tempIn;
+    if (isnan(temp)) {
+        Serial.println("Thermocouple read failed, using fallback");
+        temp = 0.0;
+    }
+    Serial.printf("Thermo Coupler temp: %.1f C\n", temp);
 
-        // Initialize HTTPS
-        modem.https_begin();
+    // Initialize HTTPS
+    modem.https_begin();
 
-        // Send data only ONCE per cycle
-        int httpRetry = RETRY_COUNT;
-        bool sent_successfully = false;
+    // Send data only ONCE per cycle
+    int httpRetry = RETRY_COUNT;
+    bool sent_successfully = false;
 
-        while (httpRetry-- && !sent_successfully)
-        {
-            esp_task_wdt_reset();  // Reset watchdog during HTTPS operations
-            
-            Serial.print("Request URL : ");
-            Serial.println(request_url[0]);
+    while (httpRetry-- && !sent_successfully)
+    {
+        esp_task_wdt_reset();  // Reset watchdog during HTTPS operations
+        
+        Serial.print("Request URL : ");
+        Serial.println(request_url[0]);
 
-            char str[MAX_URL_LENGTH];
+        char str[MAX_URL_LENGTH];
 #ifdef BOARD_SOLAR_ADC_PIN_NOT
-            uint32_t solar_voltage = analogReadMilliVolts(BOARD_SOLAR_ADC_PIN) * VOLTAGE_MULTIPLIER;
-            snprintf(str, MAX_URL_LENGTH, "%s&field1=%i&field2=%i&field3=%.0f&field4=%.0f", request_url[0], battery_voltage, solar_voltage, temp, tempIn);
+        uint32_t solar_voltage = analogReadMilliVolts(BOARD_SOLAR_ADC_PIN) * VOLTAGE_MULTIPLIER;
+        snprintf(str, MAX_URL_LENGTH, "%s&field1=%i&field2=%i&field3=%.0f&field4=%.0f", request_url[0], battery_voltage, solar_voltage, temp, tempIn);
 #else
-            snprintf(str, MAX_URL_LENGTH, "%s&field1=%i&field2=%.0f&field3=%.0f", request_url[0], battery_voltage, temp, tempIn);
+        snprintf(str, MAX_URL_LENGTH, "%s&field1=%i&field2=%.0f&field3=%.0f", request_url[0], battery_voltage, temp, tempIn);
 #endif
 
-            Serial.print("Request URL with data: ");
-            Serial.println(str);
+        Serial.print("Request URL with data: ");
+        Serial.println(str);
 
-            if (!modem.https_set_url(str))
-            {
-                Serial.println("Failed to set URL, retrying...");
-                delay(2000);
-                continue;
-            }
-
-            esp_task_wdt_reset();  // Reset before potentially long HTTPS operation
-            
-            int httpCode = modem.https_get();
-            if (httpCode != 200)
-            {
-                Serial.print("HTTP get failed ! error code = ");
-                Serial.println(httpCode);
-                delay(2000);
-                continue;
-            }
-
-            String header = modem.https_header();
-            Serial.print("HTTP Header : ");
-            Serial.println(header);
-            
-            // Extract time from HTTP Date header for next cycle
-            syncTimeFromHTTP(header);
-            
-            delay(500);
-
-            String body = modem.https_body();
-            Serial.print("HTTP body : ");
-            Serial.println(body);
-
-            sent_successfully = true;
-            delay(1000);
+        if (!modem.https_set_url(str))
+        {
+            Serial.println("Failed to set URL, retrying...");
+            delay(2000);
+            continue;
         }
 
-        if (!sent_successfully) {
-            Serial.println("Failed to send data after retries");
+        esp_task_wdt_reset();  // Reset before potentially long HTTPS operation
+        
+        int httpCode = modem.https_get();
+        if (httpCode != 200)
+        {
+            Serial.print("HTTP get failed ! error code = ");
+            Serial.println(httpCode);
+            delay(2000);
+            continue;
         }
+
+        String header = modem.https_header();
+        Serial.print("HTTP Header : ");
+        Serial.println(header);
         
-        // Check for OTA updates (only once per day to save data)
-        time_t now = time(NULL);
-        uint32_t seconds_since_last_check = now - last_ota_check_time;
-        bool should_check_ota = (last_ota_check_time == 0) || (seconds_since_last_check > 86400);  // 24 hours
+        // Extract time from HTTP Date header for next cycle
+        syncTimeFromHTTP(header);
         
-        if (should_check_ota && battery_voltage >= OTA_MINIMUM_VOLTAGE) {
-            Serial.println("\n=== OTA Update Check ===");
-            Serial.printf("Battery: %umV (safe for OTA)\n", battery_voltage);
-            
-            last_ota_check_time = now;
-            
-            if (checkForOTAUpdate()) {
-                // New firmware available - perform update
-                Serial.println("Starting OTA update process...");
-                performOTAUpdate();
-                // If we return here, update failed - continue normally
-                Serial.println("OTA update failed, continuing with normal operation");
-            } else {
-                Serial.println("No OTA update available or check failed (this is normal if no release exists yet)");
-            }
-        } else if (should_check_ota) {
-            Serial.printf("Skipping OTA check - battery too low: %umV (need %umV)\n", 
-                         battery_voltage, OTA_MINIMUM_VOLTAGE);
-        }
-        
-        // Close HTTPS session after all network operations
-        modem.https_end();
+        delay(500);
+
+        String body = modem.https_body();
+        Serial.print("HTTP body : ");
+        Serial.println(body);
+
+        sent_successfully = true;
+        delay(1000);
     }
+
+    if (!sent_successfully) {
+        Serial.println("Failed to send data after retries");
+    }
+    
+    // Close HTTPS session after all network operations
+    modem.https_end();
 
     Serial.println("-------------------------------------");
 
     Serial.println("Preparing for deep sleep...");
     Serial.flush();
-
-    // Disable watchdog before deep sleep
-    esp_task_wdt_deinit();
 
     powerModemDown();
 }
@@ -1164,4 +959,3 @@ void loop()
     }
     delay(1);
 }
-

@@ -102,6 +102,7 @@
 6. Wait for the installation of third-party dependent libraries to complete
 7. Click on the `platformio.ini` file, and in the `platformio` column
 8. Select the board name you want to use in `default_envs` and uncomment it.
+   - The T-A7670X with an A7670E modem uses an ESP32-WROVER-E; its PlatformIO environment is `T-A7670X` (`esp-wrover-kit`).
 9. Uncomment one of the lines `src_dir = xxxx` to make sure only one line works
 10. Click the (✔) symbol in the lower left corner to compile
 11. Connect the board to the computer USB-C , Micro-USB is used for module firmware upgrade
@@ -253,7 +254,6 @@
    - [T-A7670X DWG](./dimensions/T-A7670X-V1.1.dwg)
    - [T-Call-A7670 DWG](./dimensions/T-Call-A7670-V1.0.dwg)
    - [T-SIM7672-S3 DWG](./dimensions/T-SIM7672-S3-V1.0.dwg)
-
 
 
 
