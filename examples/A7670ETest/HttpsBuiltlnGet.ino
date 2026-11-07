@@ -45,11 +45,11 @@
 #endif
 
 // Firmware version: raise it for every OTA release (tools/ota_publish.py reads it from here)
-#define FIRMWARE_VERSION 1
+#define FIRMWARE_VERSION 5
 
 // OTA settings. The firmware holds no secrets (they live in NVS), so it can be hosted publicly.
 #define OTA_BASE_URL "https://raw.githubusercontent.com/pbo71/esp-firmware/main/a7670e/"
-#define OTA_DRY_RUN 1                    // 1: download and verify only, never flash. Set 0 for real updates
+#define OTA_DRY_RUN 0                    // 1: download and verify only, never flash. Set 0 for real updates
 #define OTA_CHECK_INTERVAL_SEC (24 * 3600)  // Check at most once a day (and on cold start)
 #define OTA_MIN_VOLTAGE 4000             // Only update with a healthy battery (or on USB)
 #define OTA_CHUNK_SIZE 32768             // Bytes per HTTP Range request
@@ -361,12 +361,25 @@ bool otaPendingVerify()
     return esp_ota_get_state_partition(running, &state) == ESP_OK && state == ESP_OTA_IMG_PENDING_VERIFY;
 }
 
-// Called early in setup(): notice a rollback of an update we installed earlier
+// Called early in setup(), before the modem is powered.
+// The bootloader is built with CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP: a deep-sleep wake
+// boots the firmware that ran before the sleep, so a freshly installed image only starts after
+// a normal reset. Restart into it if it is still waiting, and notice real rollbacks.
 void otaCheckRollback()
 {
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *boot = esp_ota_get_boot_partition();
+    esp_ota_img_states_t state;
+    if (boot && boot != running && esp_ota_get_state_partition(boot, &state) == ESP_OK &&
+        state == ESP_OTA_IMG_NEW) {
+        Serial.println("OTA: new firmware is installed but not started, restarting into it");
+        Serial.flush();
+        esp_restart();
+    }
+
     uint32_t tried = prefs.getUInt("ota_try", 0);
-    if (tried > FIRMWARE_VERSION) {
-        // We installed a newer version, but the old one is running again: the bootloader rolled back
+    if (tried > FIRMWARE_VERSION && esp_ota_get_last_invalid_partition() != NULL) {
+        // The bootloader marked the new image invalid and went back to this one
         Serial.printf("OTA: version %u was rolled back, it will not be installed again\n", tried);
         prefs.putUInt("ota_bad", tried);
         prefs.remove("ota_try");
@@ -570,7 +583,12 @@ void checkForOtaUpdate(uint32_t battery_voltage)
     modem.https_end();
     if (ok && !OTA_DRY_RUN) {
         prefs.putUInt("ota_try", version);
-        Serial.printf("OTA: version %lu installed, it starts after the next sleep\n", version);
+        Serial.printf("OTA: version %lu installed, restarting into it\n", version);
+        // Restart instead of deep sleep: a deep-sleep wake would boot the old firmware again
+        modem.poweroff();
+        delay(3000);
+        Serial.flush();
+        esp_restart();
     } else if (!ok) {
         Serial.println("OTA: update failed, the current firmware keeps running");
     }

@@ -11,7 +11,7 @@ Enheden henter ny firmware over mobilnettet fra et offentligt GitHub-repo, der k
    Det sker kun, når batteriet er over 4,0 V eller enheden kører på USB.
 2. **Manifest:** `version.txt` indeholder `<version> <størrelse> <md5>`. Er versionen højere end `FIRMWARE_VERSION`, hentes `firmware.bin` i bidder på 32 KB med HTTP Range-forespørgsler.
 3. **Kontrol:** Når filen er hentet, kontrolleres MD5. Først derefter skrives firmwaren til den ledige app-partition. Ved en fejl kører den gamle firmware videre.
-4. **Første kørsel:** Den nye firmware starter efter næste dvale. Den skal nå at registrere sig på netværket i første kørsel, også i stille-perioden. Ellers starter bootloaderen automatisk den gamle version igen.
+4. **Første kørsel:** Enheden genstarter med det samme ind i den nye firmware. En opvågning fra deep sleep ville starte den gamle firmware igen, fordi bootloaderen er bygget med `CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP`. Den nye firmware skal nå at registrere sig på netværket i første kørsel, også i stille-perioden. Ellers starter bootloaderen automatisk den gamle version igen.
 5. **Rollback:** Når en version er rullet tilbage, husker enheden det og installerer ikke den version igen. Ret fejlen og udgiv en ny, højere version.
 
 ## Første opsætning
@@ -62,8 +62,8 @@ Provision-buildet indeholder hemmelighederne og må **aldrig** udgives. `tools/o
 
 1. Sæt `OTA_DRY_RUN` til `0`, og lad `FIRMWARE_VERSION` stå på `2`. Flash via USB med `pio run -e T-A7670X -t upload`.
 2. Sæt `FIRMWARE_VERSION` til `3`, byg og udgiv som i trin 3.
-3. Tryk på reset. Loggen viser `OTA: version 3 installed, it starts after the next sleep`.
-4. Efter næste dvale viser loggen `Firmware version: 3 (new, waiting for confirmation)` og derefter `OTA: firmware version 3 confirmed`.
+3. Tryk på reset. Loggen viser `OTA: version 3 installed, restarting into it`.
+4. Lige efter genstarten viser loggen `Firmware version: 3 (new, waiting for confirmation)` og derefter `OTA: firmware version 3 confirmed`.
 
 ## En ny release
 
