@@ -11,7 +11,7 @@ Enheden henter ny firmware over mobilnettet fra et offentligt GitHub-repo, der k
    Det sker kun, når batteriet er over 4,0 V eller enheden kører på USB.
 2. **Manifest:** `version.txt` indeholder `<version> <størrelse> <md5>`. Er versionen højere end `FIRMWARE_VERSION`, hentes `firmware.bin` i bidder på 32 KB med HTTP Range-forespørgsler.
 3. **Kontrol:** Når filen er hentet, kontrolleres MD5. Først derefter skrives firmwaren til den ledige app-partition. Ved en fejl kører den gamle firmware videre.
-4. **Første kørsel:** Enheden genstarter med det samme ind i den nye firmware. En opvågning fra deep sleep ville starte den gamle firmware igen, fordi bootloaderen er bygget med `CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP`. Den nye firmware skal nå at registrere sig på netværket i første kørsel, også i stille-perioden. Ellers starter bootloaderen automatisk den gamle version igen.
+4. **Første kørsel:** Enheden genstarter med det samme ind i den nye firmware. En opvågning fra deep sleep ville starte den gamle firmware igen, fordi bootloaderen er bygget med `CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP`. Den nye firmware godkender sig selv, når den har sendt data til ThingSpeak, og indtil da kører den også i stille-perioden. Går den ned, starter bootloaderen den gamle version igen. Er den ikke godkendt efter 3 kørsler (`OTA_MAX_UNCONFIRMED_RUNS`), ruller den selv tilbage. Det er nødvendigt, fordi en opvågning fra deep sleep også springer bootloaderens rollback-tjek over.
 5. **Rollback:** Når en version er rullet tilbage, husker enheden det og installerer ikke den version igen. Ret fejlen og udgiv en ny, højere version.
 
 ## Første opsætning
@@ -81,7 +81,8 @@ Enhederne opdaterer ved deres næste daglige tjek. `raw.githubusercontent.com` k
 | `OTA: chunk at ...: HTTP 200` | Serveren ignorerer Range. GitHub raw understøtter det, så tjek URL'en. |
 | `OTA: MD5 mismatch` | Filen og `version.txt` passer ikke sammen. Udgiv igen med scriptet. |
 | `OTA: battery ...mV below 4000mV` | Tjekket udskydes, til batteriet er højere. |
-| `OTA: version N was rolled back` | Den nye firmware nåede ikke netværket i første kørsel. Ret fejlen, og udgiv N+1. |
+| `OTA: version N was rolled back` | Den nye firmware gik ned eller sendte ikke data inden for 3 kørsler. Ret fejlen, og udgiv N+1. |
+| `OTA: unconfirmed run 2 of 3` | Den nye firmware har endnu ikke sendt data til ThingSpeak. Ved 3 kørsler uden data ruller den tilbage. |
 | `WARNING: secrets missing in NVS` | Provision-buildet er ikke flashet (trin 2). |
 
 ## Begrænsninger i dette koncept

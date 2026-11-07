@@ -45,7 +45,7 @@
 #endif
 
 // Firmware version: raise it for every OTA release (tools/ota_publish.py reads it from here)
-#define FIRMWARE_VERSION 6
+#define FIRMWARE_VERSION 7
 
 // OTA settings. The firmware holds no secrets (they live in NVS), so it can be hosted publicly.
 #define OTA_BASE_URL "https://raw.githubusercontent.com/pbo71/esp-firmware/main/a7670e/"
@@ -53,6 +53,7 @@
 #define OTA_CHECK_INTERVAL_SEC (24 * 3600)  // Check at most once a day (and on cold start)
 #define OTA_MIN_VOLTAGE 4000             // Only update with a healthy battery (or on USB)
 #define OTA_CHUNK_SIZE 32768             // Bytes per HTTP Range request
+#define OTA_MAX_UNCONFIRMED_RUNS 3       // Roll back a new image that has not uploaded data after this many runs
 
 #define uS_TO_S_FACTOR 1000000ULL /* Conversion factor for micro seconds to seconds */
 #define TIME_TO_SLEEP 60 * 20     /* Time ESP32 will go to sleep (in seconds) */
@@ -392,6 +393,7 @@ void otaConfirmIfPending()
     if (otaPendingVerify()) {
         esp_ota_mark_app_valid_cancel_rollback();
         prefs.remove("ota_try");
+        prefs.remove("ota_runs");
         Serial.printf("OTA: firmware version %d confirmed\n", FIRMWARE_VERSION);
     }
 }
@@ -583,6 +585,7 @@ void checkForOtaUpdate(uint32_t battery_voltage)
     modem.https_end();
     if (ok && !OTA_DRY_RUN) {
         prefs.putUInt("ota_try", version);
+        prefs.remove("ota_runs");
         Serial.printf("OTA: version %lu installed, restarting into it\n", version);
         // Restart instead of deep sleep: a deep-sleep wake would boot the old firmware again
         modem.poweroff();
@@ -952,6 +955,18 @@ void setup()
 
     loadSettings();
     otaCheckRollback();
+    if (otaPendingVerify()) {
+        uint32_t runs = prefs.getUInt("ota_runs", 0) + 1;
+        prefs.putUInt("ota_runs", runs);
+        if (runs > OTA_MAX_UNCONFIRMED_RUNS) {
+            // Deep-sleep wakes skip the bootloader's rollback check, so do it ourselves
+            Serial.printf("OTA: not confirmed after %d runs, rolling back\n", OTA_MAX_UNCONFIRMED_RUNS);
+            prefs.remove("ota_runs");
+            Serial.flush();
+            esp_ota_mark_app_invalid_rollback_and_reboot();
+        }
+        Serial.printf("OTA: unconfirmed run %u of %d\n", runs, OTA_MAX_UNCONFIRMED_RUNS);
+    }
 
     // Read battery voltage FIRST
     uint32_t battery_voltage = analogReadMilliVolts(BOARD_BAT_ADC_PIN);
@@ -1162,7 +1177,9 @@ void setup()
     Serial.print("Wait for the modem to register with the network.");
     RegStatus status = REG_NO_RESULT;
     unsigned long reg_wait_start = millis();
-    while (status == REG_NO_RESULT || status == REG_SEARCHING || status == REG_UNREGISTERED)
+    // REG_EMERGENCY (11) can show up briefly after start; it gives no data service, so keep waiting
+    while (status == REG_NO_RESULT || status == REG_SEARCHING || status == REG_UNREGISTERED ||
+           status == REG_EMERGENCY)
     {
         esp_task_wdt_reset();  // Reset watchdog during network registration
         if (millis() - reg_wait_start > NETWORK_REG_TIMEOUT_MS)
@@ -1202,8 +1219,6 @@ void setup()
     Serial.printf("Registration Status:%d\n", status);
     delay(1000);
 
-    // The network works: keep a freshly installed OTA image
-    otaConfirmIfPending();
 
     String ueInfo;
     if (modem.getSystemInformation(ueInfo))
@@ -1339,6 +1354,11 @@ void setup()
 
     if (!sent_successfully && !upload_skipped) {
         Serial.println("Failed to send data after retries");
+    }
+
+    // Data reached ThingSpeak: the new firmware works well enough to keep
+    if (sent_successfully) {
+        otaConfirmIfPending();
     }
     
     // Close HTTPS session after all network operations
