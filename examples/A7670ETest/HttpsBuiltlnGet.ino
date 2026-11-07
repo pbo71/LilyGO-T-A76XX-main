@@ -45,7 +45,7 @@
 #endif
 
 // Firmware version: raise it for every OTA release (tools/ota_publish.py reads it from here)
-#define FIRMWARE_VERSION 9
+#define FIRMWARE_VERSION 10
 
 // OTA settings. The firmware holds no secrets (they live in NVS), so it can be hosted publicly.
 #define OTA_BASE_URL "https://raw.githubusercontent.com/pbo71/esp-firmware/main/a7670e/"
@@ -76,6 +76,10 @@
 #define LOW_BATTERY_THRESHOLD 4000        // 4.0V in millivolts - send the SMS below this
 #define LOW_BATTERY_RESET_THRESHOLD 4100  // 4.1V in millivolts - allow a new SMS once recovered
 
+// Daily battery voltage drop, sent to ThingSpeak field5 (vDrop). Positive = discharged, negative = charged
+#define VDROP_PERIOD_SEC (24 * 3600)
+#define VDROP_MAX_AGE_SEC (36 * 3600)  // An older reference (device was off) starts a new period
+
 // MAX6675 thermocouple (using only MAX sensor, Dallas/OneWire removed)
 #define MAX6675_SCK_PIN GPIO_NUM_18
 #define MAX6675_CS_PIN BOARD_SD_CS_PIN  // GPIO13
@@ -100,9 +104,6 @@ TinyGsm modem(SerialAT);
 #define NETWORK_APN "internet" // CHN-CT: China Telecom
 
 // RTC memory to persist data across deep sleep
-RTC_DATA_ATTR uint32_t cycle_count = 0;
-RTC_DATA_ATTR uint32_t total_mah_used = 0;
-RTC_DATA_ATTR uint32_t startup_voltage = 0;
 RTC_DATA_ATTR bool modem_initialized = false;
 RTC_DATA_ATTR bool low_battery_alert_sent = false;
 RTC_DATA_ATTR time_t last_ota_check = 0;
@@ -860,41 +861,15 @@ bool isColdStart() {
     return (reason == ESP_RST_POWERON || reason == ESP_RST_EXT);
 }
 
-void logPowerConsumption(uint32_t current_voltage, uint32_t previous_voltage) {
-    if (previous_voltage == 0) {
-        Serial.println("First cycle - no previous voltage to compare");
-        return;
+// Battery voltage in mV, averaged over 8 samples. Read with the modem off, so cycles compare.
+uint32_t readBatteryMilliVolts()
+{
+    uint32_t sum = 0;
+    for (int i = 0; i < 8; i++) {
+        sum += analogReadMilliVolts(BOARD_BAT_ADC_PIN);
+        delay(2);
     }
-
-    // Rough estimation: voltage drop correlates to mAh used
-    // LiPo discharge curve: ~3.7V nominal, usable 3.0V-4.2V = 1.2V range
-    // Simplified: ~4 mAh per 1mV drop (varies by battery chemistry)
-    // Voltage can rise between cycles (charging, ADC noise), so avoid unsigned wraparound
-    uint32_t voltage_drop = (previous_voltage > current_voltage) ? previous_voltage - current_voltage : 0;
-    uint32_t estimated_mah = voltage_drop * 4 / 100;  // mAh estimate
-    
-    if (voltage_drop > 0) {
-        total_mah_used += estimated_mah;
-        cycle_count++;
-        
-        Serial.println("\n=== Power Consumption Report ===");
-        Serial.printf("Cycle: %d\n", cycle_count);
-        Serial.printf("Voltage drop this cycle: %umV\n", voltage_drop);
-        Serial.printf("Estimated mAh used this cycle: %umAh\n", estimated_mah);
-        Serial.printf("Total mAh used so far: %umAh\n", total_mah_used);
-        Serial.printf("Current voltage: %umV\n", current_voltage);
-        
-        // Estimate remaining runtime
-        uint32_t remaining_mah = (current_voltage > 3400) ? (current_voltage - 3400) * 4 / 100 : 0;  // down to 3.4V cutoff
-        uint32_t avg_mah_per_cycle = total_mah_used / cycle_count;
-        uint32_t estimated_cycles_remaining = (avg_mah_per_cycle > 0) ? remaining_mah / avg_mah_per_cycle : 0;
-        uint32_t estimated_hours_remaining = (estimated_cycles_remaining * 20) / 60;
-        
-        Serial.printf("Avg mAh per cycle: %umAh\n", avg_mah_per_cycle);
-        Serial.printf("Estimated cycles remaining: %d\n", estimated_cycles_remaining);
-        Serial.printf("Estimated runtime remaining: %d hours\n", estimated_hours_remaining);
-        Serial.println("================================\n");
-    }
+    return sum / 8 * 2;  // The board divides the battery voltage by 2
 }
 
 void optimizeModemPower() {
@@ -985,9 +960,6 @@ void setup()
 
     // RTC data from another build (power-on, or the first wake after an OTA update) is not valid
     if (rtc_magic != RTC_MAGIC) {
-        cycle_count = 0;
-        total_mah_used = 0;
-        startup_voltage = 0;
         modem_initialized = false;
         low_battery_alert_sent = false;
         last_ota_check = 0;
@@ -1009,20 +981,14 @@ void setup()
         Serial.printf("OTA: unconfirmed run %u of %d\n", runs, OTA_MAX_UNCONFIRMED_RUNS);
     }
 
-    // Read battery voltage FIRST
-    uint32_t battery_voltage = analogReadMilliVolts(BOARD_BAT_ADC_PIN);
-    battery_voltage *= 2;
+    // Read battery voltage FIRST, before the modem draws current
+    uint32_t battery_voltage = readBatteryMilliVolts();
     
     Serial.printf("Battery voltage: %umV\n", battery_voltage);
 
-    // Log power consumption on wakeup (compare to previous cycle)
     if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
         Serial.println("\n*** Wakeup from deep sleep ***");
-        logPowerConsumption(battery_voltage, startup_voltage);
     }
-
-    // Store current voltage for next cycle comparison
-    startup_voltage = battery_voltage;
 
     // If we have valid time and it's quiet hours (00:00-06:00), sleep until 06:00
     if (haveValidTime()) {
@@ -1052,9 +1018,6 @@ void setup()
     // Check if this is a cold start from USB power
     if (isColdStart()) {
         Serial.println("Cold start detected - powering on modem automatically");
-        cycle_count = 0;  // Reset cycle counter on cold start
-        total_mah_used = 0;
-        startup_voltage = battery_voltage;
         modem_initialized = false;  // Force full initialization on cold start
 #ifdef BOARD_POWERON_PIN
         pinMode(BOARD_POWERON_PIN, OUTPUT);
@@ -1326,6 +1289,27 @@ void setup()
         Serial.printf("Thermo Coupler temp: %.1f C\n", temp);
     }
 
+    // Daily voltage drop for field5: compare with a reference stored in NVS a day ago
+    bool vdrop_ready = false;
+    int32_t vdrop_mv = 0;
+    time_t now_time = time(NULL);
+    if (!usb_only && haveValidTime()) {
+        uint32_t ref_mv = prefs.getUInt("vref_mv", 0);
+        int64_t ref_time = prefs.getLong64("vref_t", 0);
+        int64_t elapsed = (int64_t)now_time - ref_time;
+        if (ref_mv == 0 || ref_time == 0 || elapsed < 0 || elapsed > VDROP_MAX_AGE_SEC) {
+            prefs.putUInt("vref_mv", battery_voltage);
+            prefs.putLong64("vref_t", now_time);
+            Serial.printf("vDrop: new reference %umV, first value in 24 h\n", battery_voltage);
+        } else if (elapsed >= VDROP_PERIOD_SEC) {
+            // Periods run 24-30 h (20 min cycles, quiet hours), so scale the drop to exactly 24 h
+            vdrop_mv = (int32_t)(((int64_t)ref_mv - (int64_t)battery_voltage) * VDROP_PERIOD_SEC / elapsed);
+            vdrop_ready = true;
+            Serial.printf("vDrop: %ldmV per 24 h, measured over %.1f h (%umV -> %umV)\n", (long)vdrop_mv, elapsed / 3600.0,
+                          ref_mv, battery_voltage);
+        }
+    }
+
     // Initialize HTTPS
     modem.https_begin();
 
@@ -1363,6 +1347,11 @@ void setup()
             snprintf(str, MAX_URL_LENGTH, "%s&field1=%i&field2=%.0f&field3=%.0f", thingspeakUrl.c_str(), battery_voltage, temp, temp);
         }
 #endif
+
+        if (vdrop_ready) {
+            size_t used = strlen(str);
+            snprintf(str + used, MAX_URL_LENGTH - used, "&field5=%ld", (long)vdrop_mv);
+        }
 
         printMaskedUrl("Request URL with data: ", str);
 
@@ -1408,6 +1397,12 @@ void setup()
     // Data reached ThingSpeak: the new firmware works well enough to keep
     if (sent_successfully) {
         otaConfirmIfPending();
+    }
+
+    // The day's value is on ThingSpeak: start the next 24 h period from here
+    if (vdrop_ready && sent_successfully) {
+        prefs.putUInt("vref_mv", battery_voltage);
+        prefs.putLong64("vref_t", now_time);
     }
     
     // Close HTTPS session after all network operations
