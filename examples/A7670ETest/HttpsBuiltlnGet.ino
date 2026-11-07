@@ -45,7 +45,7 @@
 #endif
 
 // Firmware version: raise it for every OTA release (tools/ota_publish.py reads it from here)
-#define FIRMWARE_VERSION 5
+#define FIRMWARE_VERSION 6
 
 // OTA settings. The firmware holds no secrets (they live in NVS), so it can be hosted publicly.
 #define OTA_BASE_URL "https://raw.githubusercontent.com/pbo71/esp-firmware/main/a7670e/"
@@ -1033,20 +1033,6 @@ void setup()
     }
     Serial.println("Watchdog configured (120s timeout)");
 
-    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER)
-    {
-        Serial.println("Wakeup timer");
-        int i = 15;
-        while (i > 0)
-        {
-            Serial.printf("Modem will start in %d seconds\n", i);
-            Serial.flush();
-            delay(1000);
-            i--;
-        }
-        Serial.println("TurnON Modem!");
-    }
-
     // Configure ADC for power saving
     analogSetPinAttenuation(BOARD_BAT_ADC_PIN, ADC_11db);
 #if ESP_ARDUINO_VERSION_MAJOR < 3
@@ -1072,26 +1058,11 @@ void setup()
     delay(1000);
 #endif
 
-    // Try fast wake first if modem was previously initialized
-    bool fast_wake_attempted = false;
-    if (modem_initialized && esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
-        Serial.println("Attempting fast modem wake via DTR...");
-        pinMode(MODEM_DTR_PIN, OUTPUT);
-        digitalWrite(MODEM_DTR_PIN, LOW);  // Pull DTR low to wake
-        delay(2000);
-        
-        // Quick test - does modem respond?
-        fast_wake_attempted = true;
-        if (!modem.testAT(1000)) {
-            Serial.println("Fast wake failed, will do full reset");
-            fast_wake_attempted = false;  // Mark as failed so we do full init below
-        } else {
-            Serial.println("Fast wake successful!");
-        }
-    }
-    
-    // Do full initialization if fast wake wasn't attempted or failed
-    if (!fast_wake_attempted) {
+    // Always a full start: powerModemDown() powers the modem off completely, so there is
+    // nothing to wake via DTR. DTR low keeps the modem awake while we use it.
+    pinMode(MODEM_DTR_PIN, OUTPUT);
+    digitalWrite(MODEM_DTR_PIN, LOW);
+    {
         Serial.println("Full modem initialization...");
         // Release the reset pin hold set before deep sleep, otherwise the pulse below has no effect
         gpio_hold_dis((gpio_num_t)MODEM_RESET_PIN);
@@ -1241,16 +1212,29 @@ void setup()
         Serial.println(ueInfo);
     }
 
-    if (!modem.enableNetwork())
-    {
-        Serial.println("Enable network failed!");
+    // Data connection: registration alone is not enough, HTTP needs an IP address
+    String ipAddress;
+    bool network_ok = false;
+    for (int attempt = 1; attempt <= 3 && !network_ok; attempt++) {
+        esp_task_wdt_reset();
+        if (!modem.enableNetwork()) {
+            Serial.printf("Enable network failed (attempt %d/3)\n", attempt);
+        }
+        delay(5000);
+        ipAddress = modem.getLocalIP();
+        network_ok = ipAddress.length() > 0 && ipAddress != "0.0.0.0";
+        if (!network_ok && attempt < 3) {
+            Serial.printf("No IP address yet (attempt %d/3), reopening the data connection\n", attempt);
+            modem.disableNetwork();
+            delay(2000);
+        }
     }
-
-    delay(5000);
-
-    String ipAddress = modem.getLocalIP();
     Serial.print("Network IP:");
     Serial.println(ipAddress);
+    if (!network_ok) {
+        // SMS still works without data; upload and OTA are skipped below
+        Serial.println("No data connection - upload and OTA skipped this cycle");
+    }
 
     char buf[256];
 #ifdef BOARD_SOLAR_ADC_PIN_NOT
@@ -1283,8 +1267,12 @@ void setup()
 
     // Send data only ONCE per cycle
     int httpRetry = RETRY_COUNT;
+    bool upload_skipped = !network_ok;
     if (thingspeakKey.length() == 0) {
         Serial.println("No ThingSpeak key in NVS - upload skipped");
+        upload_skipped = true;
+    }
+    if (upload_skipped) {
         httpRetry = 0;
     }
     bool sent_successfully = false;
@@ -1349,14 +1337,16 @@ void setup()
         delay(1000);
     }
 
-    if (!sent_successfully) {
+    if (!sent_successfully && !upload_skipped) {
         Serial.println("Failed to send data after retries");
     }
     
     // Close HTTPS session after all network operations
     modem.https_end();
 
-    checkForOtaUpdate(battery_voltage);
+    if (network_ok) {
+        checkForOtaUpdate(battery_voltage);
+    }
 
     Serial.println("-------------------------------------");
 
