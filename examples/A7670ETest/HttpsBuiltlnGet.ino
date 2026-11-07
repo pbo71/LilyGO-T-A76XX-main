@@ -45,7 +45,7 @@
 #endif
 
 // Firmware version: raise it for every OTA release (tools/ota_publish.py reads it from here)
-#define FIRMWARE_VERSION 7
+#define FIRMWARE_VERSION 8
 
 // OTA settings. The firmware holds no secrets (they live in NVS), so it can be hosted publicly.
 #define OTA_BASE_URL "https://raw.githubusercontent.com/pbo71/esp-firmware/main/a7670e/"
@@ -595,6 +595,40 @@ void checkForOtaUpdate(uint32_t battery_voltage)
     } else if (!ok) {
         Serial.println("OTA: update failed, the current firmware keeps running");
     }
+}
+
+// ---------------------------------------------------------------- data connection
+// Send an AT command and print the full response (diagnostics only)
+void logAT(const char *cmd)
+{
+    String response;
+    modem.sendAT(cmd);
+    modem.waitResponse(5000UL, response);
+    response.replace("\r\n", " ");
+    response.trim();
+    Serial.printf("AT%s -> %s\n", cmd, response.c_str());
+}
+
+// IP address of PDP context 1, the context AT+HTTPINIT uses. Empty when it is not active.
+String pdpAddress()
+{
+    String response;
+    modem.sendAT("+CGPADDR=1");
+    if (modem.waitResponse(5000UL, response) != 1) {
+        return "";
+    }
+    int start = response.indexOf("+CGPADDR: 1,");
+    if (start < 0) {
+        return "";
+    }
+    String ip = response.substring(start + 12);
+    int end = ip.indexOf('\r');
+    if (end >= 0) {
+        ip = ip.substring(0, end);
+    }
+    ip.replace("\"", "");
+    ip.trim();
+    return (ip == "0.0.0.0") ? "" : ip;
 }
 
 void sendLowBatterySMS(uint32_t voltage)
@@ -1227,28 +1261,27 @@ void setup()
         Serial.println(ueInfo);
     }
 
-    // Data connection: registration alone is not enough, HTTP needs an IP address
-    String ipAddress;
-    bool network_ok = false;
-    for (int attempt = 1; attempt <= 3 && !network_ok; attempt++) {
+    // Data connection. HTTP (AT+HTTPINIT) uses PDP context 1 and activates it itself, so the
+    // socket service (AT+NETOPEN / AT+IPADDR) is not needed. Activate the context up front
+    // with a realistic timeout so a slow network gets time, and log details when it fails.
+    String ipAddress = pdpAddress();
+    for (int attempt = 1; attempt <= 3 && ipAddress.length() == 0; attempt++) {
         esp_task_wdt_reset();
-        if (!modem.enableNetwork()) {
-            Serial.printf("Enable network failed (attempt %d/3)\n", attempt);
-        }
-        delay(5000);
-        ipAddress = modem.getLocalIP();
-        network_ok = ipAddress.length() > 0 && ipAddress != "0.0.0.0";
-        if (!network_ok && attempt < 3) {
-            Serial.printf("No IP address yet (attempt %d/3), reopening the data connection\n", attempt);
-            modem.disableNetwork();
-            delay(2000);
-        }
+        Serial.printf("No IP on PDP context 1 (attempt %d/3), activating it\n", attempt);
+        modem.sendAT("+CGACT=1,1");
+        modem.waitResponse(30000UL);
+        delay(2000);
+        ipAddress = pdpAddress();
     }
     Serial.print("Network IP:");
     Serial.println(ipAddress);
-    if (!network_ok) {
-        // SMS still works without data; upload and OTA are skipped below
-        Serial.println("No data connection - upload and OTA skipped this cycle");
+    if (ipAddress.length() == 0) {
+        Serial.println("No data connection yet - network details:");
+        logAT("+CEREG?");
+        logAT("+CGATT?");
+        logAT("+CGACT?");
+        logAT("+CSQ");
+        Serial.println("Trying the upload anyway, AT+HTTPINIT may still bring the connection up");
     }
 
     char buf[256];
@@ -1282,7 +1315,7 @@ void setup()
 
     // Send data only ONCE per cycle
     int httpRetry = RETRY_COUNT;
-    bool upload_skipped = !network_ok;
+    bool upload_skipped = false;
     if (thingspeakKey.length() == 0) {
         Serial.println("No ThingSpeak key in NVS - upload skipped");
         upload_skipped = true;
@@ -1364,7 +1397,8 @@ void setup()
     // Close HTTPS session after all network operations
     modem.https_end();
 
-    if (network_ok) {
+    // Only when the upload worked: a poor connection cannot download 1 MB anyway
+    if (sent_successfully) {
         checkForOtaUpdate(battery_voltage);
     }
 
