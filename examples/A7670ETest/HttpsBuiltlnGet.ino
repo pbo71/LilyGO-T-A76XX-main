@@ -64,6 +64,8 @@
 #define MAX6675_CS_PIN BOARD_SD_CS_PIN  // GPIO13
 #define MAX6675_SO_PIN GPIO_NUM_19
 #define MAX6675_DEBUG 0  // Set 1 to print the raw MAX6675 word every cycle (wiring debug)
+#define MAX6675_MAX_PLAUSIBLE_C 150.0  // Readings above this are treated as wiring noise
+#define MAX6675_MAX_DIFF_C 2.0         // Two reads 250 ms apart must agree within this
 
 #ifdef DUMP_AT_COMMANDS // if enabled it requires the streamDebugger lib
 #include <StreamDebugger.h>
@@ -223,9 +225,9 @@ void initThermocouplePins()
     pinMode(MAX6675_SO_PIN, INPUT_PULLUP);
 }
 
-// Read the MAX6675 directly so wiring faults can be told apart from real readings.
+// One raw read of the MAX6675, so wiring faults can be told apart from real readings.
 // Returns NAN on any fault.
-float readThermocoupleCelsius()
+float readThermocoupleOnce()
 {
     uint16_t raw = 0;
     digitalWrite(MAX6675_CS_PIN, LOW);
@@ -263,6 +265,32 @@ float readThermocoupleCelsius()
         return NAN;
     }
     return (raw >> 3) * 0.25;
+}
+
+// Two reads that must agree and be plausible: a loose wire gives random values
+// that can pass the bit checks, but rarely the same value twice.
+float readThermocoupleCelsius()
+{
+    float first = readThermocoupleOnce();
+    if (isnan(first)) {
+        return NAN;
+    }
+    delay(250);  // MAX6675 needs up to 220 ms for a new conversion
+    float second = readThermocoupleOnce();
+    if (isnan(second)) {
+        return NAN;
+    }
+
+    if (fabsf(first - second) > MAX6675_MAX_DIFF_C) {
+        Serial.printf("MAX6675 fault: unstable reading (%.2f C vs %.2f C) - loose wire?\n", first, second);
+        return NAN;
+    }
+    float temp = (first + second) / 2;
+    if (temp > MAX6675_MAX_PLAUSIBLE_C) {
+        Serial.printf("MAX6675 fault: %.2f C is above %.0f C - loose wire?\n", temp, MAX6675_MAX_PLAUSIBLE_C);
+        return NAN;
+    }
+    return temp;
 }
 
 // Print a URL without the ThingSpeak write key
