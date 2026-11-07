@@ -18,7 +18,7 @@
 // See all AT commands, if wanted
 #define DUMP_AT_COMMANDS
 
-#define SMS_TARGET "+4540959135" // Change the number you want to send sms message
+#define SMS_TARGET "+45XXXXXXXX" // Change the number you want to send sms message
 
 #include <TinyGsmClient.h>
 
