@@ -15,7 +15,9 @@
 // #define DUMP_AT_COMMANDS
 
 #include "utilities.h"
-#include "secrets.h"  // ALERT_PHONE_NUMBER and THINGSPEAK_API_KEY, not in git (see secrets.h.example)
+#ifdef PROVISION_SECRETS
+#include "secrets.h"  // Only in the T-A7670X-provision build, never in OTA firmware
+#endif
 #include <TinyGsmClient.h>
 #include <WiFi.h>
 #include <esp32-hal-adc.h>
@@ -29,6 +31,10 @@
 #include <time.h>
 #include <sys/time.h>
 #include "lwip/apps/sntp.h"
+#include <Preferences.h>
+#include <Update.h>
+#include <MD5Builder.h>
+#include "esp_ota_ops.h"
 
 // debug: set 0 to remove Serial prints to save power
 #define DEBUG 0
@@ -37,6 +43,16 @@
 #else
   #define LOG(fmt, ...)
 #endif
+
+// Firmware version: raise it for every OTA release (tools/ota_publish.py reads it from here)
+#define FIRMWARE_VERSION 1
+
+// OTA settings. The firmware holds no secrets (they live in NVS), so it can be hosted publicly.
+#define OTA_BASE_URL "https://raw.githubusercontent.com/pbo71/esp-firmware/main/a7670e/"
+#define OTA_DRY_RUN 1                    // 1: download and verify only, never flash. Set 0 for real updates
+#define OTA_CHECK_INTERVAL_SEC (24 * 3600)  // Check at most once a day (and on cold start)
+#define OTA_MIN_VOLTAGE 4000             // Only update with a healthy battery (or on USB)
+#define OTA_CHUNK_SIZE 32768             // Bytes per HTTP Range request
 
 #define uS_TO_S_FACTOR 1000000ULL /* Conversion factor for micro seconds to seconds */
 #define TIME_TO_SLEEP 60 * 20     /* Time ESP32 will go to sleep (in seconds) */
@@ -88,9 +104,18 @@ RTC_DATA_ATTR uint32_t total_mah_used = 0;
 RTC_DATA_ATTR uint32_t startup_voltage = 0;
 RTC_DATA_ATTR bool modem_initialized = false;
 RTC_DATA_ATTR bool low_battery_alert_sent = false;
+RTC_DATA_ATTR time_t last_ota_check = 0;
+// RTC memory survives deep sleep, also across an OTA update to a build with a different layout.
+// The magic tells whether the RTC data above was written by this exact build.
+#define RTC_MAGIC (0xA7670000UL | FIRMWARE_VERSION)
+RTC_DATA_ATTR uint32_t rtc_magic = 0;
 
-const char *request_url[] = {
-    "https://api.thingspeak.com/update?api_key=" THINGSPEAK_API_KEY};
+// Secrets and OTA state, stored in NVS (written once by the T-A7670X-provision build)
+Preferences prefs;
+String alertPhone;
+String thingspeakKey;
+String thingspeakUrl;
+
 
 // Time & quiet-hours helpers
 bool haveValidTime()
@@ -297,9 +322,258 @@ float readThermocoupleCelsius()
 void printMaskedUrl(const char *label, const char *url)
 {
     String masked(url);
-    masked.replace(THINGSPEAK_API_KEY, "****");
+    if (thingspeakKey.length() > 0) {
+        masked.replace(thingspeakKey, "****");
+    }
     Serial.print(label);
     Serial.println(masked);
+}
+
+// ---------------------------------------------------------------- settings in NVS
+void loadSettings()
+{
+    prefs.begin("a7670", false);
+#ifdef PROVISION_SECRETS
+    prefs.putString("phone", ALERT_PHONE_NUMBER);
+    prefs.putString("tskey", THINGSPEAK_API_KEY);
+    Serial.println("PROVISION: secrets written to NVS");
+#endif
+    alertPhone = prefs.getString("phone", "");
+    thingspeakKey = prefs.getString("tskey", "");
+    thingspeakUrl = String("https://api.thingspeak.com/update?api_key=") + thingspeakKey;
+    if (alertPhone.length() == 0 || thingspeakKey.length() == 0) {
+        Serial.println("WARNING: secrets missing in NVS - flash the T-A7670X-provision build once");
+    }
+}
+
+// ---------------------------------------------------------------- OTA rollback
+// Tell the Arduino core not to accept a new OTA image at boot. We confirm it ourselves
+// once the network works; if the new firmware resets before that, the bootloader rolls back.
+extern "C" bool verifyRollbackLater()
+{
+    return true;
+}
+
+bool otaPendingVerify()
+{
+    esp_ota_img_states_t state;
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    return esp_ota_get_state_partition(running, &state) == ESP_OK && state == ESP_OTA_IMG_PENDING_VERIFY;
+}
+
+// Called early in setup(): notice a rollback of an update we installed earlier
+void otaCheckRollback()
+{
+    uint32_t tried = prefs.getUInt("ota_try", 0);
+    if (tried > FIRMWARE_VERSION) {
+        // We installed a newer version, but the old one is running again: the bootloader rolled back
+        Serial.printf("OTA: version %u was rolled back, it will not be installed again\n", tried);
+        prefs.putUInt("ota_bad", tried);
+        prefs.remove("ota_try");
+    }
+}
+
+// Called once the network is registered: the new firmware works well enough to keep
+void otaConfirmIfPending()
+{
+    if (otaPendingVerify()) {
+        esp_ota_mark_app_valid_cancel_rollback();
+        prefs.remove("ota_try");
+        Serial.printf("OTA: firmware version %d confirmed\n", FIRMWARE_VERSION);
+    }
+}
+
+// ---------------------------------------------------------------- OTA download
+// Read exactly len bytes of the current HTTP response body with a single AT+HTTPREAD.
+// One read per response works whatever the modem's READMODE is.
+bool otaReadBody(uint8_t *buf, size_t len)
+{
+    modem.sendAT("+HTTPREAD=0,", (uint32_t)len);
+    if (modem.waitResponse(5000UL) != 1) {
+        return false;
+    }
+    size_t got = 0;
+    while (got < len) {
+        if (modem.waitResponse(30000UL, "+HTTPREAD: ") != 1) {
+            return false;
+        }
+        int n = SerialAT.readStringUntil('\n').toInt();
+        if (n <= 0 || got + n > len) {
+            return false;
+        }
+        if (SerialAT.readBytes(buf + got, n) != (size_t)n) {
+            return false;
+        }
+        got += n;
+    }
+    modem.waitResponse(5000UL, "+HTTPREAD: 0");
+    return true;
+}
+
+// Download the image in Range chunks, check the MD5 and (unless dry run) write it to the OTA partition
+bool otaDownload(uint32_t size, const char *md5hex, bool dryRun)
+{
+    uint8_t *buf = (uint8_t *)malloc(OTA_CHUNK_SIZE);
+    if (!buf) {
+        Serial.println("OTA: out of memory");
+        return false;
+    }
+    if (!dryRun) {
+        if (!Update.begin(size)) {
+            Serial.printf("OTA: Update.begin failed: %s\n", Update.errorString());
+            free(buf);
+            return false;
+        }
+        Update.setMD5(md5hex);
+    }
+
+    MD5Builder md5;
+    md5.begin();
+    uint32_t offset = 0;
+    int lastPercent = -10;
+    bool ok = true;
+    while (offset < size) {
+        uint32_t len = min((uint32_t)OTA_CHUNK_SIZE, size - offset);
+        char range[40];
+        snprintf(range, sizeof(range), "bytes=%lu-%lu", (unsigned long)offset, (unsigned long)(offset + len - 1));
+
+        ok = false;
+        for (int attempt = 0; attempt < 3 && !ok; attempt++) {
+            esp_task_wdt_reset();
+            // Fresh HTTP session per chunk: the modem does not replace USERDATA (the Range header)
+            // within one session, and a second Range header makes the server answer 501
+            if (!modem.https_begin() || !modem.https_set_ssl_index(0) ||
+                !modem.https_set_url(OTA_BASE_URL "firmware.bin") || !modem.https_add_header("Range", range)) {
+                delay(1000);
+                continue;
+            }
+            size_t bodyLen = 0;
+            int status = modem.https_get(&bodyLen);
+            if (status != 206 || bodyLen != len) {
+                Serial.printf("OTA: chunk at %lu: HTTP %d, %u bytes (expected 206, %lu)\n",
+                              (unsigned long)offset, status, (unsigned)bodyLen, (unsigned long)len);
+                if (bodyLen > 0 && bodyLen < 1024) {
+                    Serial.println(modem.https_body().substring(0, 300));  // Server error text
+                }
+                delay(1000);
+                continue;
+            }
+            ok = otaReadBody(buf, len);
+            if (!ok) {
+                Serial.printf("OTA: reading chunk at %lu failed\n", (unsigned long)offset);
+            }
+        }
+        if (!ok) {
+            break;
+        }
+
+        md5.add(buf, len);
+        if (!dryRun && Update.write(buf, len) != len) {
+            Serial.printf("OTA: flash write failed: %s\n", Update.errorString());
+            ok = false;
+            break;
+        }
+        offset += len;
+
+        int percent = (int)((uint64_t)offset * 100 / size);
+        if (percent - lastPercent >= 10 || offset == size) {
+            Serial.printf("OTA: %d%% (%lu/%lu)\n", percent, (unsigned long)offset, (unsigned long)size);
+            lastPercent = percent;
+        }
+    }
+    free(buf);
+
+    if (!ok) {
+        if (!dryRun) {
+            Update.abort();
+        }
+        return false;
+    }
+    md5.calculate();
+    if (!md5.toString().equalsIgnoreCase(md5hex)) {
+        Serial.printf("OTA: MD5 mismatch (got %s, expected %s)\n", md5.toString().c_str(), md5hex);
+        if (!dryRun) {
+            Update.abort();
+        }
+        return false;
+    }
+    if (dryRun) {
+        Serial.println("OTA: DRY RUN - download and MD5 OK, nothing written");
+        return true;
+    }
+    if (!Update.end()) {
+        Serial.printf("OTA: Update.end failed: %s\n", Update.errorString());
+        return false;
+    }
+    return true;
+}
+
+// Check the manifest and install a newer version. Runs after the ThingSpeak upload.
+void checkForOtaUpdate(uint32_t battery_voltage)
+{
+    time_t now = time(NULL);
+    if (haveValidTime() && last_ota_check != 0 && now >= last_ota_check &&
+        now - last_ota_check < OTA_CHECK_INTERVAL_SEC) {
+        return;  // Checked recently
+    }
+    if (battery_voltage < OTA_MIN_VOLTAGE) {
+        Serial.printf("OTA: battery %umV below %umV, check postponed\n", battery_voltage, (uint32_t)OTA_MIN_VOLTAGE);
+        return;
+    }
+    if (haveValidTime()) {
+        last_ota_check = now;
+    }
+
+    Serial.printf("OTA: checking for updates (running version %d)\n", FIRMWARE_VERSION);
+    esp_task_wdt_reset();
+    modem.https_begin();
+    configureSSLForOTA();
+    if (!modem.https_set_url(OTA_BASE_URL "version.txt")) {
+        modem.https_end();
+        return;
+    }
+    int status = modem.https_get();
+    if (status != 200) {
+        Serial.printf("OTA: version.txt HTTP %d\n", status);
+        modem.https_end();
+        return;
+    }
+    String manifest = modem.https_body();
+
+    // version.txt: "<version> <size> <md5>"
+    unsigned long version = 0, size = 0;
+    char md5hex[33] = {0};
+    if (sscanf(manifest.c_str(), "%lu %lu %32s", &version, &size, md5hex) != 3 || strlen(md5hex) != 32) {
+        Serial.println("OTA: version.txt has an unexpected format");
+        modem.https_end();
+        return;
+    }
+    if (version <= FIRMWARE_VERSION) {
+        Serial.printf("OTA: up to date (latest %lu)\n", version);
+        modem.https_end();
+        return;
+    }
+    if (version <= prefs.getUInt("ota_bad", 0)) {
+        Serial.printf("OTA: version %lu was rolled back before, skipped\n", version);
+        modem.https_end();
+        return;
+    }
+    const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+    if (!next || size == 0 || size > next->size) {
+        Serial.printf("OTA: image size %lu does not fit the OTA partition\n", size);
+        modem.https_end();
+        return;
+    }
+
+    Serial.printf("OTA: downloading version %lu (%lu bytes)%s\n", version, size, OTA_DRY_RUN ? " - DRY RUN" : "");
+    bool ok = otaDownload(size, md5hex, OTA_DRY_RUN);
+    modem.https_end();
+    if (ok && !OTA_DRY_RUN) {
+        prefs.putUInt("ota_try", version);
+        Serial.printf("OTA: version %lu installed, it starts after the next sleep\n", version);
+    } else if (!ok) {
+        Serial.println("OTA: update failed, the current firmware keeps running");
+    }
 }
 
 void sendLowBatterySMS(uint32_t voltage)
@@ -310,7 +584,11 @@ void sendLowBatterySMS(uint32_t voltage)
              voltage, (uint32_t)MINIMUM_MODEM_VOLTAGE);
 
     Serial.println("Sending low battery SMS...");
-    if (modem.sendSMS(ALERT_PHONE_NUMBER, message)) {
+    if (alertPhone.length() == 0) {
+        Serial.println("No alert phone number in NVS - SMS skipped");
+        return;
+    }
+    if (modem.sendSMS(alertPhone, message)) {
         Serial.println("Low battery SMS sent");
         low_battery_alert_sent = true;  // Only one SMS until the battery has recovered
     } else {
@@ -641,6 +919,21 @@ void setup()
     delay(50);
     printResetAndWakeReason();
     initThermocouplePins();
+    Serial.printf("Firmware version: %d%s\n", FIRMWARE_VERSION, otaPendingVerify() ? " (new, waiting for confirmation)" : "");
+
+    // RTC data from another build (power-on, or the first wake after an OTA update) is not valid
+    if (rtc_magic != RTC_MAGIC) {
+        cycle_count = 0;
+        total_mah_used = 0;
+        startup_voltage = 0;
+        modem_initialized = false;
+        low_battery_alert_sent = false;
+        last_ota_check = 0;
+        rtc_magic = RTC_MAGIC;
+    }
+
+    loadSettings();
+    otaCheckRollback();
 
     // Read battery voltage FIRST
     uint32_t battery_voltage = analogReadMilliVolts(BOARD_BAT_ADC_PIN);
@@ -659,7 +952,8 @@ void setup()
 
     // If we have valid time and it's quiet hours (00:00-06:00), sleep until 06:00
     if (haveValidTime()) {
-        if (!shouldReportNow()) {
+        // A new OTA image must reach the network in its first run, so it does not sleep through quiet hours
+        if (!shouldReportNow() && !otaPendingVerify()) {
             uint32_t sec = secondsUntilHour(6);
             Serial.printf("Quiet hours detected - sleeping %u seconds until 06:00\n", sec);
             
@@ -695,6 +989,7 @@ void setup()
 #endif
     }
 
+    SerialAT.setRxBufferSize(4096);  // Large HTTPREAD bursts during OTA
     SerialAT.begin(115200, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
 
     // Initialize watchdog timer to prevent hangs during modem startup
@@ -918,6 +1213,9 @@ void setup()
     Serial.printf("Registration Status:%d\n", status);
     delay(1000);
 
+    // The network works: keep a freshly installed OTA image
+    otaConfirmIfPending();
+
     String ueInfo;
     if (modem.getSystemInformation(ueInfo))
     {
@@ -967,28 +1265,32 @@ void setup()
 
     // Send data only ONCE per cycle
     int httpRetry = RETRY_COUNT;
+    if (thingspeakKey.length() == 0) {
+        Serial.println("No ThingSpeak key in NVS - upload skipped");
+        httpRetry = 0;
+    }
     bool sent_successfully = false;
 
     while (httpRetry-- && !sent_successfully)
     {
         esp_task_wdt_reset();  // Reset watchdog during HTTPS operations
         
-        printMaskedUrl("Request URL : ", request_url[0]);
+        printMaskedUrl("Request URL : ", thingspeakUrl.c_str());
 
         // Temperature fields are left out on a sensor fault, so ThingSpeak shows a gap instead of 0
         char str[MAX_URL_LENGTH];
 #ifdef BOARD_SOLAR_ADC_PIN_NOT
         uint32_t solar_voltage = analogReadMilliVolts(BOARD_SOLAR_ADC_PIN) * VOLTAGE_MULTIPLIER;
         if (isnan(temp)) {
-            snprintf(str, MAX_URL_LENGTH, "%s&field1=%i&field2=%i", request_url[0], battery_voltage, solar_voltage);
+            snprintf(str, MAX_URL_LENGTH, "%s&field1=%i&field2=%i", thingspeakUrl.c_str(), battery_voltage, solar_voltage);
         } else {
-            snprintf(str, MAX_URL_LENGTH, "%s&field1=%i&field2=%i&field3=%.0f&field4=%.0f", request_url[0], battery_voltage, solar_voltage, temp, temp);
+            snprintf(str, MAX_URL_LENGTH, "%s&field1=%i&field2=%i&field3=%.0f&field4=%.0f", thingspeakUrl.c_str(), battery_voltage, solar_voltage, temp, temp);
         }
 #else
         if (isnan(temp)) {
-            snprintf(str, MAX_URL_LENGTH, "%s&field1=%i", request_url[0], battery_voltage);
+            snprintf(str, MAX_URL_LENGTH, "%s&field1=%i", thingspeakUrl.c_str(), battery_voltage);
         } else {
-            snprintf(str, MAX_URL_LENGTH, "%s&field1=%i&field2=%.0f&field3=%.0f", request_url[0], battery_voltage, temp, temp);
+            snprintf(str, MAX_URL_LENGTH, "%s&field1=%i&field2=%.0f&field3=%.0f", thingspeakUrl.c_str(), battery_voltage, temp, temp);
         }
 #endif
 
@@ -1035,6 +1337,8 @@ void setup()
     
     // Close HTTPS session after all network operations
     modem.https_end();
+
+    checkForOtaUpdate(battery_voltage);
 
     Serial.println("-------------------------------------");
 

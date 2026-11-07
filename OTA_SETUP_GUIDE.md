@@ -1,192 +1,91 @@
-# OTA Firmware Update Setup Guide
+# OTA-opdatering af A7670ETest
 
-## 🚀 Quick Start - GitHub Releases Method
+Enheden henter ny firmware over mobilnettet fra et offentligt GitHub-repo, der kun indeholder firmwarefiler. Telefonnummer og ThingSpeak-nøgle ligger ikke i firmwaren. De gemmes én gang i enhedens flash-hukommelse (NVS), så firmwaren kan ligge offentligt.
 
-### Step 1: Build og få .bin filen
+## Sådan virker det
 
-1. Build dit projekt:
-   ```bash
-   platformio run
+1. **Tjek:** Efter upload til ThingSpeak tjekker enheden én gang i døgnet og ved koldstart:
    ```
-
-2. Find din firmware fil her:
+   https://raw.githubusercontent.com/pbo71/esp-firmware/main/a7670e/version.txt
    ```
-   .pio/build/[your_board]/firmware.bin
-   ```
+   Det sker kun, når batteriet er over 4,0 V eller enheden kører på USB.
+2. **Manifest:** `version.txt` indeholder `<version> <størrelse> <md5>`. Er versionen højere end `FIRMWARE_VERSION`, hentes `firmware.bin` i bidder på 32 KB med HTTP Range-forespørgsler.
+3. **Kontrol:** Når filen er hentet, kontrolleres MD5. Først derefter skrives firmwaren til den ledige app-partition. Ved en fejl kører den gamle firmware videre.
+4. **Første kørsel:** Den nye firmware starter efter næste dvale. Den skal nå at registrere sig på netværket i første kørsel, også i stille-perioden. Ellers starter bootloaderen automatisk den gamle version igen.
+5. **Rollback:** Når en version er rullet tilbage, husker enheden det og installerer ikke den version igen. Ret fejlen og udgiv en ny, højere version.
 
-### Step 2: Upload til GitHub Releases
+## Første opsætning
 
-1. Gå til dit GitHub repository: https://github.com/pbo71/LilyGO-T-A76XX-main
+### 1. Opret firmware-repoet
 
-2. Klik på "Releases" → "Create a new release"
-
-3. Tag version: `v1.0.0` (første release)
-
-4. Upload **2 filer**:
-   - `firmware.bin` - din compiled firmware
-   - `version.txt` - en fil med kun tallet: `1`
-
-5. Publish release
-
-### Step 3: Få download URLs
-
-Efter release, højreklik på filerne og få URLs:
-
-```
-https://github.com/pbo71/LilyGO-T-A76XX-main/releases/download/v1.0.0/firmware.bin
-https://github.com/pbo71/LilyGO-T-A76XX-main/releases/download/v1.0.0/version.txt
-```
-
-### Step 4: Opdater koden
-
-Åbn `HttpsBuiltlnGet.ino` og erstat URLs på linje 55-56:
-
-```cpp
-#define OTA_FIRMWARE_URL "https://github.com/pbo71/LilyGO-T-A76XX-main/releases/download/v1.0.0/firmware.bin"
-#define OTA_VERSION_URL "https://github.com/pbo71/LilyGO-T-A76XX-main/releases/download/v1.0.0/version.txt"
-```
-
-### Step 5: Release en opdatering
-
-Når du vil opdatere enheder i marken:
-
-1. **Lav ændringer** i din kode
-
-2. **Opdater version** i koden:
-   ```cpp
-   #define CURRENT_FIRMWARE_VERSION 2  // Øg til 2
-   ```
-
-3. **Build ny firmware**:
-   ```bash
-   platformio run
-   ```
-
-4. **Opret ny GitHub Release**: `v2.0.0`
-   - Upload ny `firmware.bin`
-   - Upload `version.txt` med indhold: `2`
-
-5. **Opdater URLs** i din kode til v2.0.0
-
-6. Enheder downloader automatisk næste gang de vågner! 🎉
-
----
-
-## 🌐 Alternative Metoder
-
-### Metode 2: Simpel Python Webserver (Lokalt test)
-
-Perfekt til test før production:
+Opret et nyt **offentligt** repo på GitHub, `pbo71/esp-firmware`, med en README, så der findes en `main`-branch. Klon det lokalt, f.eks. ved siden af dette repo:
 
 ```bash
-# Placer firmware i en mappe
-cd firmware_folder
-python -m http.server 8000
-
-# Brug ngrok til at expose lokalt:
-ngrok http 8000
-
-# Brug ngrok HTTPS URL i koden
+git clone https://github.com/pbo71/esp-firmware.git ../esp-firmware
 ```
 
-### Metode 3: Firebase Storage (Gratis tier)
+Bruger du et andet navn eller en anden branch, skal du rette `OTA_BASE_URL` i `HttpsBuiltlnGet.ino`.
 
-1. Opret Firebase projekt
-2. Upload filer til Storage
-3. Lav filer public eller brug signed URLs
-4. URL format:
+### 2. Skriv hemmelighederne til enheden
+
+Udfyld `examples/A7670ETest/secrets.h` ud fra `secrets.h.example`, og flash provision-buildet via USB én gang:
+
+```bash
+pio run -e T-A7670X-provision -t upload -t monitor
+```
+
+I serielmonitoren skal der stå `PROVISION: secrets written to NVS`. Bagefter kan du flashe det almindelige build, `T-A7670X`, så meget du vil. Hemmelighederne bliver liggende i NVS.
+
+Provision-buildet indeholder hemmelighederne og må **aldrig** udgives. `tools/ota_publish.py` nægter at udgive det.
+
+### 3. Prøvekørsel (henter kun, flasher ikke)
+
+`OTA_DRY_RUN` står som standard på `1`. Så henter enheden filen og tjekker MD5, men skriver intet.
+
+1. Enheden kører version 1. Den har du lige flashet i trin 2.
+2. Sæt `FIRMWARE_VERSION` til `2`, byg og udgiv:
+   ```bash
+   pio run -e T-A7670X
+   python tools/ota_publish.py ../esp-firmware
+   git -C ../esp-firmware add a7670e
+   git -C ../esp-firmware commit -m "Firmware version 2"
+   git -C ../esp-firmware push
    ```
-   https://firebasestorage.googleapis.com/v0/b/[bucket]/o/firmware.bin?alt=media
+3. Tryk på reset, så enheden laver en koldstart og tjekker med det samme. I loggen skal der stå:
+   ```
+   OTA: downloading version 2 (... bytes) - DRY RUN
+   OTA: 10% ...
+   OTA: DRY RUN - download and MD5 OK, nothing written
    ```
 
-### Metode 4: AWS S3 (Professional)
+### 4. Første rigtige opdatering
 
-1. Opret S3 bucket
-2. Upload filer
-3. Sæt bucket policy til public read
-4. Brug CloudFront for HTTPS
+1. Sæt `OTA_DRY_RUN` til `0`, og lad `FIRMWARE_VERSION` stå på `2`. Flash via USB med `pio run -e T-A7670X -t upload`.
+2. Sæt `FIRMWARE_VERSION` til `3`, byg og udgiv som i trin 3.
+3. Tryk på reset. Loggen viser `OTA: version 3 installed, it starts after the next sleep`.
+4. Efter næste dvale viser loggen `Firmware version: 3 (new, waiting for confirmation)` og derefter `OTA: firmware version 3 confirmed`.
 
----
+## En ny release
 
-## 📝 version.txt Format
+1. Lav dine ændringer, og hæv `FIRMWARE_VERSION`.
+2. Kør `pio run -e T-A7670X` og `python tools/ota_publish.py ../esp-firmware`.
+3. Commit og push i `esp-firmware`.
 
-Filen skal BARE indeholde versionsnummeret:
+Enhederne opdaterer ved deres næste daglige tjek. `raw.githubusercontent.com` kan cache en fil i nogle minutter efter et push.
 
-```
-2
-```
+## Fejlsøgning
 
-Ingen newlines, ingen ekstra tekst.
+| Log | Betydning |
+|---|---|
+| `OTA: version.txt HTTP 404` | Repo, sti eller branch passer ikke med `OTA_BASE_URL`, eller repoet er ikke offentligt. |
+| `OTA: chunk at ...: HTTP 200` | Serveren ignorerer Range. GitHub raw understøtter det, så tjek URL'en. |
+| `OTA: MD5 mismatch` | Filen og `version.txt` passer ikke sammen. Udgiv igen med scriptet. |
+| `OTA: battery ...mV below 4000mV` | Tjekket udskydes, til batteriet er højere. |
+| `OTA: version N was rolled back` | Den nye firmware nåede ikke netværket i første kørsel. Ret fejlen, og udgiv N+1. |
+| `WARNING: secrets missing in NVS` | Provision-buildet er ikke flashet (trin 2). |
 
----
+## Begrænsninger i dette koncept
 
-## 🔒 Sikkerhedstips
-
-1. ✅ Brug ALTID HTTPS (aldrig HTTP)
-2. ✅ Test firmware lokalt først
-3. ✅ Start med små version increments
-4. ✅ Hold backup af alle firmware versioner
-5. ✅ Log OTA events til ThingSpeak for monitoring
-
----
-
-## 🐛 Troubleshooting
-
-### "Version check failed, HTTP code: 404"
-- Tjek at URLs er korrekte
-- Verificer at filer er public accessible
-- Test URL i browser først
-
-### "Invalid firmware size"
-- Tjek at .bin filen er uploaded korrekt
-- Max størrelse er 2MB (defineret i kode)
-
-### "Not enough space for OTA update"
-- ESP32 partition skal have plads til ny firmware
-- Tjek platformio.ini partition scheme
-
-### "Battery too low for OTA"
-- OTA kræver minimum 3.8V
-- Lad enheden oplade først
-
----
-
-## 📊 Monitor OTA Process
-
-Tilføj logging til ThingSpeak:
-
-```cpp
-// Efter succesfuld OTA
-char ota_log[64];
-snprintf(ota_log, 64, "OTA: v%d -> v%d", old_version, new_version);
-// Send til ThingSpeak eller SMS
-```
-
----
-
-## 🎯 Production Workflow
-
-```
-1. Develop → Test lokalt
-2. Build firmware
-3. Tag version i Git
-4. Create GitHub Release
-5. Upload firmware + version.txt
-6. Verify URLs in browser
-7. Monitor første enheder
-8. Full rollout
-```
-
----
-
-## 📱 Test Checklist
-
-- [ ] Build firmware successfully
-- [ ] Upload to GitHub Release
-- [ ] Test URL i browser (skal downloade fil)
-- [ ] Verify version.txt indhold
-- [ ] Test på én enhed først
-- [ ] Monitor serial output under OTA
-- [ ] Verify device reboots med ny version
-- [ ] Check normal operation efter OTA
-
+- **Kilden kontrolleres ikke:** TLS kører uden certifikatkontrol (`authmode` 0), og MD5 kommer fra samme server som firmwaren. MD5 beskytter mod en ødelagt download, men ikke mod en, der kan ændre dit firmware-repo eller sidder midt i forbindelsen. Det kan løses senere med signeret firmware eller et CA-certifikat i modemmet.
+- **Dataforbrug:** En opdatering bruger cirka 1 MB data. Det daglige tjek bruger under 1 KB.
+- **Plads:** En app-partition er 1,25 MB. Firmwaren fylder cirka 1,06 MB.
