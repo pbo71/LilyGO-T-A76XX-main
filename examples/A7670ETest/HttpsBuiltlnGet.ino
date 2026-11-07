@@ -45,7 +45,7 @@
 #endif
 
 // Firmware version: raise it for every OTA release (tools/ota_publish.py reads it from here)
-#define FIRMWARE_VERSION 8
+#define FIRMWARE_VERSION 9
 
 // OTA settings. The firmware holds no secrets (they live in NVS), so it can be hosted publicly.
 #define OTA_BASE_URL "https://raw.githubusercontent.com/pbo71/esp-firmware/main/a7670e/"
@@ -535,13 +535,17 @@ void checkForOtaUpdate(uint32_t battery_voltage)
         Serial.printf("OTA: battery %umV below %umV, check postponed\n", battery_voltage, (uint32_t)OTA_MIN_VOLTAGE);
         return;
     }
-    if (haveValidTime()) {
-        last_ota_check = now;
-    }
-
     Serial.printf("OTA: checking for updates (running version %d)\n", FIRMWARE_VERSION);
     esp_task_wdt_reset();
-    modem.https_begin();
+    bool http_ready = modem.https_begin();
+    if (!http_ready) {
+        delay(3000);
+        http_ready = modem.https_begin();
+    }
+    if (!http_ready) {
+        Serial.println("OTA: HTTPINIT failed, check postponed to the next cycle");
+        return;
+    }
     configureSSLForOTA();
     if (!modem.https_set_url(OTA_BASE_URL "version.txt")) {
         modem.https_end();
@@ -554,6 +558,9 @@ void checkForOtaUpdate(uint32_t battery_voltage)
         return;
     }
     String manifest = modem.https_body();
+    if (haveValidTime()) {
+        last_ota_check = now;  // Only a completed check counts, failures are retried next cycle
+    }
 
     // version.txt: "<version> <size> <md5>"
     unsigned long version = 0, size = 0;
@@ -1261,9 +1268,18 @@ void setup()
         Serial.println(ueInfo);
     }
 
-    // Data connection. HTTP (AT+HTTPINIT) uses PDP context 1 and activates it itself, so the
-    // socket service (AT+NETOPEN / AT+IPADDR) is not needed. Activate the context up front
-    // with a realistic timeout so a slow network gets time, and log details when it fails.
+    // Data connection. HTTP (AT+HTTPINIT) uses PDP context 1; it is checked and activated below
+    // with a realistic timeout, and details are logged when it fails.
+    // Socket service: HTTP does not need it, but while it is open the data connection stays up
+    // between HTTP sessions (the upload, the OTA check and one session per OTA chunk). Without it
+    // a new AT+HTTPINIT failed right after the upload. NETOPEN can take up to 120 s to answer;
+    // the library waits only 1 s, so wait here instead.
+    modem.sendAT("+NETOPEN");
+    int netopen = modem.waitResponse(30000UL, "+NETOPEN: 0", "+IP ERROR: Network is already opened");
+    if (netopen != 1 && netopen != 2) {
+        Serial.println("NETOPEN not confirmed within 30 s");
+    }
+
     String ipAddress = pdpAddress();
     for (int attempt = 1; attempt <= 3 && ipAddress.length() == 0; attempt++) {
         esp_task_wdt_reset();
