@@ -18,7 +18,6 @@
 #include "secrets.h"  // ALERT_PHONE_NUMBER and THINGSPEAK_API_KEY, not in git (see secrets.h.example)
 #include <TinyGsmClient.h>
 #include <WiFi.h>
-#include <max6675.h>
 #include <esp32-hal-adc.h>
 #include <esp_wifi.h>
 #include <esp_bt.h>
@@ -61,7 +60,10 @@
 #define LOW_BATTERY_RESET_THRESHOLD 4100  // 4.1V in millivolts - allow a new SMS once recovered
 
 // MAX6675 thermocouple (using only MAX sensor, Dallas/OneWire removed)
-MAX6675 thermocouple(GPIO_NUM_18, BOARD_SD_CS_PIN, GPIO_NUM_19);
+#define MAX6675_SCK_PIN GPIO_NUM_18
+#define MAX6675_CS_PIN BOARD_SD_CS_PIN  // GPIO13
+#define MAX6675_SO_PIN GPIO_NUM_19
+#define MAX6675_DEBUG 0  // Set 1 to print the raw MAX6675 word every cycle (wiring debug)
 
 #ifdef DUMP_AT_COMMANDS // if enabled it requires the streamDebugger lib
 #include <StreamDebugger.h>
@@ -209,6 +211,67 @@ bool shouldReportNow()
     int hour = tm_now.tm_hour;
     // Don't report between 00:00 (inclusive) and 06:00 (exclusive)
     return !(hour >= 0 && hour < 6);
+}
+
+void initThermocouplePins()
+{
+    // CS high starts a conversion; it takes ~220 ms, so do this early in setup()
+    pinMode(MAX6675_CS_PIN, OUTPUT);
+    digitalWrite(MAX6675_CS_PIN, HIGH);
+    pinMode(MAX6675_SCK_PIN, OUTPUT);
+    // Pull-up: a loose SO wire then reads 0xFFFF instead of floating. The MAX6675 drives SO while CS is low.
+    pinMode(MAX6675_SO_PIN, INPUT_PULLUP);
+}
+
+// Read the MAX6675 directly so wiring faults can be told apart from real readings.
+// Returns NAN on any fault.
+float readThermocoupleCelsius()
+{
+    uint16_t raw = 0;
+    digitalWrite(MAX6675_CS_PIN, LOW);
+    delayMicroseconds(10);
+    for (int i = 15; i >= 0; i--) {
+        digitalWrite(MAX6675_SCK_PIN, LOW);
+        delayMicroseconds(10);
+        if (digitalRead(MAX6675_SO_PIN)) {
+            raw |= (1 << i);
+        }
+        digitalWrite(MAX6675_SCK_PIN, HIGH);
+        delayMicroseconds(10);
+    }
+    digitalWrite(MAX6675_CS_PIN, HIGH);
+
+#if MAX6675_DEBUG
+    Serial.printf("MAX6675 raw: 0x%04X\n", raw);
+#endif
+
+    const char *fault = NULL;
+    if (raw == 0xFFFF) {
+        fault = "SO is always HIGH - SO wire (pin 19) loose, or no VCC/GND to the module";
+    } else if (raw == 0x0000) {
+        // Also what a powerless module returns; a real 0.00-0.24 C reading is dropped too
+        fault = "SO is always LOW - check the CS (13) / SCK (18) wires and GND to the module";
+    } else if (raw & 0x8002) {
+        // Bit 15 and bit 1 are always 0 on a working MAX6675
+        fault = "invalid bits set - loose wire or noise on SO/SCK";
+    } else if (raw & 0x0004) {
+        fault = "thermocouple open - check the probe wires at the screw terminals";
+    }
+
+    if (fault) {
+        Serial.printf("MAX6675 fault: %s\n", fault);
+        return NAN;
+    }
+    return (raw >> 3) * 0.25;
+}
+
+// Print a URL without the ThingSpeak write key
+void printMaskedUrl(const char *label, const char *url)
+{
+    String masked(url);
+    masked.replace(THINGSPEAK_API_KEY, "****");
+    Serial.print(label);
+    Serial.println(masked);
 }
 
 void sendLowBatterySMS(uint32_t voltage)
@@ -549,6 +612,7 @@ void setup()
     Serial.begin(115200);
     delay(50);
     printResetAndWakeReason();
+    initThermocouplePins();
 
     // Read battery voltage FIRST
     uint32_t battery_voltage = analogReadMilliVolts(BOARD_BAT_ADC_PIN);
@@ -863,13 +927,12 @@ void setup()
     }
 
     // Read MAX6675 thermocouple ONLY when we're about to transmit (saves power)
-    float tempIn = thermocouple.readCelsius();
-    float temp = tempIn;
+    float temp = readThermocoupleCelsius();
     if (isnan(temp)) {
-        Serial.println("Thermocouple read failed, using fallback");
-        temp = 0.0;
+        Serial.println("Thermocouple read failed, temperature left out of this upload");
+    } else {
+        Serial.printf("Thermo Coupler temp: %.1f C\n", temp);
     }
-    Serial.printf("Thermo Coupler temp: %.1f C\n", temp);
 
     // Initialize HTTPS
     modem.https_begin();
@@ -882,19 +945,26 @@ void setup()
     {
         esp_task_wdt_reset();  // Reset watchdog during HTTPS operations
         
-        Serial.print("Request URL : ");
-        Serial.println(request_url[0]);
+        printMaskedUrl("Request URL : ", request_url[0]);
 
+        // Temperature fields are left out on a sensor fault, so ThingSpeak shows a gap instead of 0
         char str[MAX_URL_LENGTH];
 #ifdef BOARD_SOLAR_ADC_PIN_NOT
         uint32_t solar_voltage = analogReadMilliVolts(BOARD_SOLAR_ADC_PIN) * VOLTAGE_MULTIPLIER;
-        snprintf(str, MAX_URL_LENGTH, "%s&field1=%i&field2=%i&field3=%.0f&field4=%.0f", request_url[0], battery_voltage, solar_voltage, temp, tempIn);
+        if (isnan(temp)) {
+            snprintf(str, MAX_URL_LENGTH, "%s&field1=%i&field2=%i", request_url[0], battery_voltage, solar_voltage);
+        } else {
+            snprintf(str, MAX_URL_LENGTH, "%s&field1=%i&field2=%i&field3=%.0f&field4=%.0f", request_url[0], battery_voltage, solar_voltage, temp, temp);
+        }
 #else
-        snprintf(str, MAX_URL_LENGTH, "%s&field1=%i&field2=%.0f&field3=%.0f", request_url[0], battery_voltage, temp, tempIn);
+        if (isnan(temp)) {
+            snprintf(str, MAX_URL_LENGTH, "%s&field1=%i", request_url[0], battery_voltage);
+        } else {
+            snprintf(str, MAX_URL_LENGTH, "%s&field1=%i&field2=%.0f&field3=%.0f", request_url[0], battery_voltage, temp, temp);
+        }
 #endif
 
-        Serial.print("Request URL with data: ");
-        Serial.println(str);
+        printMaskedUrl("Request URL with data: ", str);
 
         if (!modem.https_set_url(str))
         {
