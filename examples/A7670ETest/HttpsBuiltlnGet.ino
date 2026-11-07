@@ -45,7 +45,7 @@
 #endif
 
 // Firmware version: raise it for every OTA release (tools/ota_publish.py reads it from here)
-#define FIRMWARE_VERSION 10
+#define FIRMWARE_VERSION 11
 
 // OTA settings. The firmware holds no secrets (they live in NVS), so it can be hosted publicly.
 #define OTA_BASE_URL "https://raw.githubusercontent.com/pbo71/esp-firmware/main/a7670e/"
@@ -1351,6 +1351,11 @@ void setup()
         if (vdrop_ready) {
             size_t used = strlen(str);
             snprintf(str + used, MAX_URL_LENGTH - used, "&field5=%ld", (long)vdrop_mv);
+        }
+        {
+            // Firmware version, so the running version is visible without a serial monitor
+            size_t used = strlen(str);
+            snprintf(str + used, MAX_URL_LENGTH - used, "&field6=%d", FIRMWARE_VERSION);
         }
 
         printMaskedUrl("Request URL with data: ", str);
