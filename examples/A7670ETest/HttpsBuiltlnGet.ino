@@ -35,6 +35,8 @@
 #include <Update.h>
 #include <MD5Builder.h>
 #include "esp_ota_ops.h"
+#include <OneWire.h>
+#include <DallasTemperature.h>
 
 // debug: set 0 to remove Serial prints to save power
 #define DEBUG 0
@@ -45,10 +47,13 @@
 #endif
 
 // Firmware version: raise it for every OTA release (tools/ota_publish.py reads it from here)
-#define FIRMWARE_VERSION 11
+#define FIRMWARE_VERSION 12
 
 // OTA settings. The firmware holds no secrets (they live in NVS), so it can be hosted publicly.
-#define OTA_BASE_URL "https://raw.githubusercontent.com/pbo71/esp-firmware/main/a7670e/"
+// The folder comes from NVS ("ota_dir"), so one binary can follow a test or a stable folder.
+// A board without the setting uses OTA_DEFAULT_FOLDER.
+#define OTA_BASE_URL "https://raw.githubusercontent.com/pbo71/esp-firmware/main/"
+#define OTA_DEFAULT_FOLDER "a7670e"
 #define OTA_DRY_RUN 0                    // 1: download and verify only, never flash. Set 0 for real updates
 #define OTA_CHECK_INTERVAL_SEC (24 * 3600)  // Check at most once a day (and on cold start)
 #define OTA_MIN_VOLTAGE 4000             // Only update with a healthy battery (or on USB)
@@ -80,7 +85,14 @@
 #define VDROP_PERIOD_SEC (24 * 3600)
 #define VDROP_MAX_AGE_SEC (36 * 3600)  // An older reference (device was off) starts a new period
 
-// MAX6675 thermocouple (using only MAX sensor, Dallas/OneWire removed)
+// ThingSpeak fields (same layout on every board):
+//   field1 firmware version, field2 outdoor temp (DS18B20), field3 indoor temp (MAX6675),
+//   field4 battery mV, field5 daily vDrop mV. A missing or faulty sensor leaves its field out.
+
+// DS18B20 outdoor sensor on GPIO0 (needs a 4.7k pull-up to 3.3V). Optional: if none answers, field2 is left out
+#define DS18B20_PIN 0
+
+// MAX6675 thermocouple for the indoor (sauna / hut) temperature
 #define MAX6675_SCK_PIN GPIO_NUM_18
 #define MAX6675_CS_PIN BOARD_SD_CS_PIN  // GPIO13
 #define MAX6675_SO_PIN GPIO_NUM_19
@@ -95,8 +107,6 @@ TinyGsm modem(debugger);
 #else
 TinyGsm modem(SerialAT);
 #endif
-
-#define BOARD_SOLAR_ADC_PIN_NOT
 
 // It depends on the operator whether to set up an APN. If some operators do not set up an APN,
 // they will be rejected when registering for the network. You need to ask the local operator for the specific APN.
@@ -117,6 +127,7 @@ Preferences prefs;
 String alertPhone;
 String thingspeakKey;
 String thingspeakUrl;
+String otaBaseUrl;
 
 
 // Time & quiet-hours helpers
@@ -320,6 +331,26 @@ float readThermocoupleCelsius()
     return temp;
 }
 
+// Outdoor temperature from a DS18B20, or NAN when no sensor answers or the value is invalid
+float readOutdoorCelsius()
+{
+    OneWire oneWire(DS18B20_PIN);
+    DallasTemperature sensors(&oneWire);
+    sensors.begin();
+    if (sensors.getDeviceCount() == 0) {
+        Serial.println("DS18B20: no sensor found, outdoor temperature left out");
+        return NAN;
+    }
+    sensors.requestTemperatures();  // Blocks up to 750 ms at 12-bit resolution
+    float t = sensors.getTempCByIndex(0);
+    // -127 = lost contact, 85 = power-on value (no conversion done)
+    if (t == DEVICE_DISCONNECTED_C || t == 85.0f || t < -55.0f || t > 85.0f) {
+        Serial.printf("DS18B20 fault: invalid reading %.2f C\n", t);
+        return NAN;
+    }
+    return t;
+}
+
 // Print a URL without the ThingSpeak write key
 void printMaskedUrl(const char *label, const char *url)
 {
@@ -338,11 +369,29 @@ void loadSettings()
 #ifdef PROVISION_SECRETS
     prefs.putString("phone", ALERT_PHONE_NUMBER);
     prefs.putString("tskey", THINGSPEAK_API_KEY);
+#ifdef OTA_FOLDER
+    prefs.putString("ota_dir", OTA_FOLDER);
+#else
+    prefs.remove("ota_dir");
+#endif
     Serial.println("PROVISION: secrets written to NVS");
 #endif
     alertPhone = prefs.getString("phone", "");
     thingspeakKey = prefs.getString("tskey", "");
     thingspeakUrl = String("https://api.thingspeak.com/update?api_key=") + thingspeakKey;
+    String folder = prefs.getString("ota_dir", OTA_DEFAULT_FOLDER);
+    // Only plain folder names, so a bad value cannot break the URL
+    bool folderOk = folder.length() > 0;
+    for (size_t i = 0; i < folder.length(); i++) {
+        char c = folder[i];
+        if (!isalnum((unsigned char)c) && c != '-' && c != '_') folderOk = false;
+    }
+    if (!folderOk) {
+        Serial.println("WARNING: invalid ota_dir in NVS, using " OTA_DEFAULT_FOLDER);
+        folder = OTA_DEFAULT_FOLDER;
+    }
+    otaBaseUrl = String(OTA_BASE_URL) + folder + "/";
+    Serial.printf("OTA folder: %s\n", folder.c_str());
     if (alertPhone.length() == 0 || thingspeakKey.length() == 0) {
         Serial.println("WARNING: secrets missing in NVS - flash the T-A7670X-provision build once");
     }
@@ -459,7 +508,7 @@ bool otaDownload(uint32_t size, const char *md5hex, bool dryRun)
             // Fresh HTTP session per chunk: the modem does not replace USERDATA (the Range header)
             // within one session, and a second Range header makes the server answer 501
             if (!modem.https_begin() || !modem.https_set_ssl_index(0) ||
-                !modem.https_set_url(OTA_BASE_URL "firmware.bin") || !modem.https_add_header("Range", range)) {
+                !modem.https_set_url((otaBaseUrl + "firmware.bin").c_str()) || !modem.https_add_header("Range", range)) {
                 delay(1000);
                 continue;
             }
@@ -548,7 +597,7 @@ void checkForOtaUpdate(uint32_t battery_voltage)
         return;
     }
     configureSSLForOTA();
-    if (!modem.https_set_url(OTA_BASE_URL "version.txt")) {
+    if (!modem.https_set_url((otaBaseUrl + "version.txt").c_str())) {
         modem.https_end();
         return;
     }
@@ -1263,15 +1312,7 @@ void setup()
         Serial.println("Trying the upload anyway, AT+HTTPINIT may still bring the connection up");
     }
 
-    char buf[256];
-#ifdef BOARD_SOLAR_ADC_PIN_NOT
-    uint32_t solar_voltage = analogReadMilliVolts(BOARD_SOLAR_ADC_PIN);
-    solar_voltage *= 2;
-    snprintf(buf, 256, "Battery:%umV \tSolar:%umV", battery_voltage, solar_voltage);
-#else
-    snprintf(buf, 256, "Battery:%umV ", battery_voltage);
-#endif
-    Serial.println(buf);
+    Serial.printf("Battery:%umV\n", battery_voltage);
 
     // Network is registered, so the SMS can go out here
     if (battery_voltage < LOW_BATTERY_THRESHOLD && !low_battery_alert_sent) {
@@ -1281,12 +1322,16 @@ void setup()
         low_battery_alert_sent = false;
     }
 
-    // Read MAX6675 thermocouple ONLY when we're about to transmit (saves power)
+    // Read the sensors ONLY when we're about to transmit (saves power)
     float temp = readThermocoupleCelsius();
     if (isnan(temp)) {
-        Serial.println("Thermocouple read failed, temperature left out of this upload");
+        Serial.println("Thermocouple read failed, indoor temperature left out of this upload");
     } else {
-        Serial.printf("Thermo Coupler temp: %.1f C\n", temp);
+        Serial.printf("Indoor temp (MAX6675): %.1f C\n", temp);
+    }
+    float outdoor = readOutdoorCelsius();
+    if (!isnan(outdoor)) {
+        Serial.printf("Outdoor temp (DS18B20): %.1f C\n", outdoor);
     }
 
     // Daily voltage drop for field5: compare with a reference stored in NVS a day ago
@@ -1331,31 +1376,21 @@ void setup()
         
         printMaskedUrl("Request URL : ", thingspeakUrl.c_str());
 
-        // Temperature fields are left out on a sensor fault, so ThingSpeak shows a gap instead of 0
+        // Field layout: see "ThingSpeak fields" at the top. Temperature fields are left out
+        // on a sensor fault, so ThingSpeak shows a gap instead of 0
         char str[MAX_URL_LENGTH];
-#ifdef BOARD_SOLAR_ADC_PIN_NOT
-        uint32_t solar_voltage = analogReadMilliVolts(BOARD_SOLAR_ADC_PIN) * VOLTAGE_MULTIPLIER;
-        if (isnan(temp)) {
-            snprintf(str, MAX_URL_LENGTH, "%s&field1=%i&field2=%i", thingspeakUrl.c_str(), battery_voltage, solar_voltage);
-        } else {
-            snprintf(str, MAX_URL_LENGTH, "%s&field1=%i&field2=%i&field3=%.0f&field4=%.0f", thingspeakUrl.c_str(), battery_voltage, solar_voltage, temp, temp);
+        size_t used = snprintf(str, MAX_URL_LENGTH, "%s&field1=%d", thingspeakUrl.c_str(), FIRMWARE_VERSION);
+        if (!isnan(outdoor) && used < MAX_URL_LENGTH) {
+            used += snprintf(str + used, MAX_URL_LENGTH - used, "&field2=%.1f", outdoor);
         }
-#else
-        if (isnan(temp)) {
-            snprintf(str, MAX_URL_LENGTH, "%s&field1=%i", thingspeakUrl.c_str(), battery_voltage);
-        } else {
-            snprintf(str, MAX_URL_LENGTH, "%s&field1=%i&field2=%.0f&field3=%.0f", thingspeakUrl.c_str(), battery_voltage, temp, temp);
+        if (!isnan(temp) && used < MAX_URL_LENGTH) {
+            used += snprintf(str + used, MAX_URL_LENGTH - used, "&field3=%.0f", temp);
         }
-#endif
-
-        if (vdrop_ready) {
-            size_t used = strlen(str);
-            snprintf(str + used, MAX_URL_LENGTH - used, "&field5=%ld", (long)vdrop_mv);
+        if (used < MAX_URL_LENGTH) {
+            used += snprintf(str + used, MAX_URL_LENGTH - used, "&field4=%u", battery_voltage);
         }
-        {
-            // Firmware version, so the running version is visible without a serial monitor
-            size_t used = strlen(str);
-            snprintf(str + used, MAX_URL_LENGTH - used, "&field6=%d", FIRMWARE_VERSION);
+        if (vdrop_ready && used < MAX_URL_LENGTH) {
+            used += snprintf(str + used, MAX_URL_LENGTH - used, "&field5=%ld", (long)vdrop_mv);
         }
 
         printMaskedUrl("Request URL with data: ", str);
