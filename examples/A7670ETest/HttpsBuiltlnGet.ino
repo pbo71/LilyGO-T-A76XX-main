@@ -47,7 +47,7 @@
 #endif
 
 // Firmware version: raise it for every OTA release (tools/ota_publish.py reads it from here)
-#define FIRMWARE_VERSION 12
+#define FIRMWARE_VERSION 13
 
 // OTA settings. The firmware holds no secrets (they live in NVS), so it can be hosted publicly.
 // The folder comes from NVS ("ota_dir"), so one binary can follow a test or a stable folder.
@@ -61,7 +61,23 @@
 #define OTA_MAX_UNCONFIRMED_RUNS 3       // Roll back a new image that has not uploaded data after this many runs
 
 #define uS_TO_S_FACTOR 1000000ULL /* Conversion factor for micro seconds to seconds */
-#define TIME_TO_SLEEP 60 * 20     /* Time ESP32 will go to sleep (in seconds) */
+
+// Reporting schedule. The ESP32 wakes every SAMPLE_INTERVAL_SEC and reads the temperature without
+// the modem (cheap). The modem only starts when a report is due:
+//   - at least every REPORT_INTERVAL_SEC between ACTIVE_START_HOUR and ACTIVE_END_HOUR (Danish time)
+//   - at once when it has risen HEATING_RISE_C since the last report (someone lit the sauna).
+//     This fires once; while it keeps rising or is at or above HOT_THRESHOLD_C, reports come
+//     every REPORT_INTERVAL_HOT_SEC instead of every 5 minutes
+// Outside the active hours nothing is sent and the board sleeps until ACTIVE_START_HOUR.
+#define SAMPLE_INTERVAL_SEC (5 * 60)
+#define REPORT_INTERVAL_SEC (60 * 60)
+#define REPORT_INTERVAL_HOT_SEC (30 * 60)
+#define REPORT_SLACK_SEC 60              // A report due within this is sent now instead of a sample later
+#define HOT_THRESHOLD_C 50.0
+#define HEATING_RISE_C 5.0
+#define ACTIVE_START_HOUR 7
+#define ACTIVE_END_HOUR 22
+#define LOCAL_TIMEZONE "CET-1CEST,M3.5.0,M10.5.0/3"  // Danish time with daylight saving
 
 // Define constants instead of magic numbers
 #define RETRY_COUNT 3
@@ -70,7 +86,6 @@
 #define SIM_READY_TIMEOUT_MS 60000UL      // Give up waiting for the SIM after 1 minute
 #define NETWORK_REG_TIMEOUT_MS 180000UL   // Give up network registration after 3 minutes
 #define MODEM_INIT_RETRY 10
-#define SLEEP_DURATION_MINUTES 20
 #define CHECK_BATTERY_THRESHOLD 3600  // 3.6V in millivolts
 #define DEEP_SLEEP_THRESHOLD 3500     // 3.5V in millivolts - critical battery protection
 #define MINIMUM_MODEM_VOLTAGE 3900    // 3.9V minimum for reliable modem startup
@@ -117,6 +132,9 @@ TinyGsm modem(SerialAT);
 RTC_DATA_ATTR bool modem_initialized = false;
 RTC_DATA_ATTR bool low_battery_alert_sent = false;
 RTC_DATA_ATTR time_t last_ota_check = 0;
+RTC_DATA_ATTR time_t last_report_time = 0;   // Start of the last report attempt (UTC)
+RTC_DATA_ATTR float last_report_temp = NAN;  // Indoor temperature sent with it
+RTC_DATA_ATTR bool last_report_heating = false;  // The last report saw the temperature rising
 // RTC memory survives deep sleep, also across an OTA update to a build with a different layout.
 // The magic tells whether the RTC data above was written by this exact build.
 #define RTC_MAGIC (0xA7670000UL | FIRMWARE_VERSION)
@@ -137,10 +155,21 @@ bool haveValidTime()
     return (now > 1600000000); // after 2020
 }
 
+// Seconds since 1970 for a UTC date (days-from-civil algorithm, no timezone involved)
+time_t utcFromCivil(int y, int m, int d, int hh, int mm, int ss)
+{
+    y -= m <= 2;
+    int era = (y >= 0 ? y : y - 399) / 400;
+    int yoe = y - era * 400;
+    int doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    int64_t days = (int64_t)era * 146097 + doe - 719468;
+    return (time_t)(days * 86400 + hh * 3600 + mm * 60 + ss);
+}
+
 time_t parseHTTPDate(String dateStr)
 {
     // Parse "Date: 16 Feb 2026 19:01:43 GMT" or "Date: Sun, 16 Feb 2026 19:01:43 GMT"
-    struct tm tm_time = {0};
     const char* months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
                             "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
     
@@ -192,17 +221,8 @@ time_t parseHTTPDate(String dateStr)
         return 0;
     }
     
-    tm_time.tm_mday = day;
-    tm_time.tm_mon = month;
-    tm_time.tm_year = year - 1900;
-    tm_time.tm_hour = hour;
-    tm_time.tm_min = min;
-    tm_time.tm_sec = sec;
-    tm_time.tm_isdst = 0;
-    
-    // Convert to UTC timestamp (HTTP Date is always in GMT)
-    time_t utc_time = mktime(&tm_time);
-    return utc_time;
+    // Convert to a UTC timestamp (HTTP Date is always in GMT). Not mktime(): that applies the local timezone
+    return utcFromCivil(year, month + 1, day, hour, min, sec);
 }
 
 void syncTimeFromHTTP(String httpHeader)
@@ -211,16 +231,13 @@ void syncTimeFromHTTP(String httpHeader)
     time_t http_time = parseHTTPDate(httpHeader);
     
     if (http_time > 1600000000) {
-        // Add GMT+1 timezone offset (3600 seconds)
-        http_time += 3600;
-        
+        // The clock runs in UTC; LOCAL_TIMEZONE turns it into Danish time where needed
         struct timeval tv = { .tv_sec = http_time, .tv_usec = 0 };
         settimeofday(&tv, NULL);
-        
-        
+
         struct tm timeinfo;
         localtime_r(&http_time, &timeinfo);
-        Serial.printf("Time synced from HTTP: %04d-%02d-%02d %02d:%02d:%02d GMT+1\n",
+        Serial.printf("Time synced from HTTP: %04d-%02d-%02d %02d:%02d:%02d Danish time\n",
                       timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
                       timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
     } else {
@@ -228,29 +245,46 @@ void syncTimeFromHTTP(String httpHeader)
     }
 }
 
-uint32_t secondsUntilHour(int targetHour)
+// Seconds until the next targetHour:00 Danish time (daylight saving handled by mktime)
+uint32_t secondsUntilLocalHour(int targetHour)
 {
     time_t now = time(NULL);
-    struct tm tm_now;
-    gmtime_r(&now, &tm_now);
-    int hour = tm_now.tm_hour;
-    int minute = tm_now.tm_min;
-    int second = tm_now.tm_sec;
-
-    int delta = targetHour - hour;
-    if (delta <= 0) delta += 24;
-    uint32_t seconds = delta * 3600 - minute * 60 - second;
-    return seconds;
+    struct tm t;
+    localtime_r(&now, &t);
+    t.tm_hour = targetHour;
+    t.tm_min = 0;
+    t.tm_sec = 0;
+    t.tm_isdst = -1;
+    time_t target = mktime(&t);
+    if (target <= now) {
+        t.tm_mday += 1;
+        t.tm_hour = targetHour;
+        t.tm_isdst = -1;
+        target = mktime(&t);
+    }
+    return (uint32_t)(target - now);
 }
 
-bool shouldReportNow()
+// True between ACTIVE_START_HOUR and ACTIVE_END_HOUR Danish time
+bool inActiveHours()
 {
     time_t now = time(NULL);
-    struct tm tm_now;
-    gmtime_r(&now, &tm_now);
-    int hour = tm_now.tm_hour;
-    // Don't report between 00:00 (inclusive) and 06:00 (exclusive)
-    return !(hour >= 0 && hour < 6);
+    struct tm t;
+    localtime_r(&now, &t);
+    return t.tm_hour >= ACTIVE_START_HOUR && t.tm_hour < ACTIVE_END_HOUR;
+}
+
+// Deep sleep without touching the modem (it is already off)
+void sleepWithoutModem(uint32_t sec)
+{
+#ifdef MODEM_RESET_PIN
+    gpio_hold_en((gpio_num_t)MODEM_RESET_PIN);
+    gpio_deep_sleep_hold_en();
+#endif
+    Serial.printf("Sleeping %u s without the modem\n", sec);
+    Serial.flush();
+    esp_sleep_enable_timer_wakeup((uint64_t)sec * uS_TO_S_FACTOR);
+    esp_deep_sleep_start();
 }
 
 void initThermocouplePins()
@@ -783,18 +817,11 @@ void powerModemDown()
     esp_task_wdt_deinit();
     delay(50);
 
-    // Adaptive sleep duration based on battery level
-    uint32_t sleep_duration;
-    if (battery_voltage < 4000) {
-        sleep_duration = 60 * 30;  // 30 minutes when battery is low
-        Serial.printf("Low battery (%umV), extending sleep to 30 min\n", battery_voltage);
-    } else {
-        sleep_duration = TIME_TO_SLEEP;  // Normal 20 minutes
-        Serial.printf("Normal battery (%umV), sleeping 20 min\n", battery_voltage);
-    }
-    
+    // The next wake is a cheap temperature sample; the schedule decides when the modem runs again
+    Serial.printf("Battery %umV, next sample in %d s\n", battery_voltage, SAMPLE_INTERVAL_SEC);
+
     // Enable only timer wakeup and enter deep sleep.
-    esp_sleep_enable_timer_wakeup(sleep_duration * uS_TO_S_FACTOR);
+    esp_sleep_enable_timer_wakeup((uint64_t)SAMPLE_INTERVAL_SEC * uS_TO_S_FACTOR);
     delay(200);
     esp_deep_sleep_start();
 }
@@ -1003,6 +1030,8 @@ void setup()
 {
     Serial.begin(115200);
     delay(50);
+    setenv("TZ", LOCAL_TIMEZONE, 1);
+    tzset();
     printResetAndWakeReason();
     initThermocouplePins();
     Serial.printf("Firmware version: %d%s\n", FIRMWARE_VERSION, otaPendingVerify() ? " (new, waiting for confirmation)" : "");
@@ -1012,11 +1041,62 @@ void setup()
         modem_initialized = false;
         low_battery_alert_sent = false;
         last_ota_check = 0;
+        last_report_time = 0;
+        last_report_temp = NAN;
+        last_report_heating = false;
         rtc_magic = RTC_MAGIC;
     }
 
     loadSettings();
     otaCheckRollback();
+
+    // Read battery voltage FIRST, before the modem draws current
+    uint32_t battery_voltage = readBatteryMilliVolts();
+
+    Serial.printf("Battery voltage: %umV\n", battery_voltage);
+
+    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
+        Serial.println("\n*** Wakeup from deep sleep ***");
+    }
+
+    // Indoor temperature first: it decides whether the modem is needed at all
+    delay(250);  // The MAX6675 needs a full conversion after CS went high in initThermocouplePins()
+    float temp = readThermocoupleCelsius();
+    if (isnan(temp)) {
+        Serial.println("Thermocouple read failed, indoor temperature left out");
+    } else {
+        Serial.printf("Indoor temp (MAX6675): %.1f C\n", temp);
+    }
+
+    // Rising since the last report (someone lit the sauna, or it is still heating up)
+    bool heating = !isnan(temp) && !isnan(last_report_temp) && temp >= last_report_temp + HEATING_RISE_C;
+
+    // Schedule. A new OTA image and a board without a clock always report, to confirm or to get the time
+    if (haveValidTime() && !otaPendingVerify()) {
+        if (!inActiveHours()) {
+            uint32_t sec = secondsUntilLocalHour(ACTIVE_START_HOUR);
+            Serial.printf("Outside active hours - sleeping until %02d:00\n", ACTIVE_START_HOUR);
+            sleepWithoutModem(sec);
+        }
+        time_t now = time(NULL);
+        float ref = isnan(temp) ? last_report_temp : temp;
+        bool hot = !isnan(ref) && ref >= HOT_THRESHOLD_C;
+        uint32_t interval = (hot || last_report_heating) ? REPORT_INTERVAL_HOT_SEC : REPORT_INTERVAL_SEC;
+        bool due = last_report_time == 0 || now < last_report_time ||
+                   now - last_report_time + REPORT_SLACK_SEC >= (time_t)interval;
+        if (heating && !last_report_heating) {
+            Serial.printf("Temperature rose %.1f C since the last report - reporting now\n", temp - last_report_temp);
+        } else if (!due) {
+            Serial.printf("No report due (last %ld s ago, interval %u s)\n", (long)(now - last_report_time), interval);
+            sleepWithoutModem(SAMPLE_INTERVAL_SEC);
+        }
+    }
+    // From here the modem runs. Remember this attempt, so a failing network does not start it every 5 minutes
+    last_report_time = time(NULL);
+    last_report_temp = temp;
+    last_report_heating = heating;
+
+    // Count only runs that use the modem, so a new image gets its full chances to upload
     if (otaPendingVerify()) {
         uint32_t runs = prefs.getUInt("ota_runs", 0) + 1;
         prefs.putUInt("ota_runs", runs);
@@ -1028,27 +1108,6 @@ void setup()
             esp_ota_mark_app_invalid_rollback_and_reboot();
         }
         Serial.printf("OTA: unconfirmed run %u of %d\n", runs, OTA_MAX_UNCONFIRMED_RUNS);
-    }
-
-    // Read battery voltage FIRST, before the modem draws current
-    uint32_t battery_voltage = readBatteryMilliVolts();
-    
-    Serial.printf("Battery voltage: %umV\n", battery_voltage);
-
-    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
-        Serial.println("\n*** Wakeup from deep sleep ***");
-    }
-
-    // If we have valid time and it's quiet hours (00:00-06:00), sleep until 06:00
-    if (haveValidTime()) {
-        // A new OTA image must reach the network in its first run, so it does not sleep through quiet hours
-        if (!shouldReportNow() && !otaPendingVerify()) {
-            uint32_t sec = secondsUntilHour(6);
-            Serial.printf("Quiet hours detected - sleeping %u seconds until 06:00\n", sec);
-            
-            esp_sleep_enable_timer_wakeup((uint64_t)sec * uS_TO_S_FACTOR);
-            esp_deep_sleep_start();
-        }
     }
 
     // Check if battery is too low for modem startup
@@ -1322,13 +1381,7 @@ void setup()
         low_battery_alert_sent = false;
     }
 
-    // Read the sensors ONLY when we're about to transmit (saves power)
-    float temp = readThermocoupleCelsius();
-    if (isnan(temp)) {
-        Serial.println("Thermocouple read failed, indoor temperature left out of this upload");
-    } else {
-        Serial.printf("Indoor temp (MAX6675): %.1f C\n", temp);
-    }
+    // The indoor temperature was read at wake-up; the outdoor sensor only matters for an upload
     float outdoor = readOutdoorCelsius();
     if (!isnan(outdoor)) {
         Serial.printf("Outdoor temp (DS18B20): %.1f C\n", outdoor);
@@ -1347,7 +1400,7 @@ void setup()
             prefs.putLong64("vref_t", now_time);
             Serial.printf("vDrop: new reference %umV, first value in 24 h\n", battery_voltage);
         } else if (elapsed >= VDROP_PERIOD_SEC) {
-            // Periods run 24-30 h (20 min cycles, quiet hours), so scale the drop to exactly 24 h
+            // Periods run 24-34 h (hourly reports, no reports at night), so scale the drop to exactly 24 h
             vdrop_mv = (int32_t)(((int64_t)ref_mv - (int64_t)battery_voltage) * VDROP_PERIOD_SEC / elapsed);
             vdrop_ready = true;
             Serial.printf("vDrop: %ldmV per 24 h, measured over %.1f h (%umV -> %umV)\n", (long)vdrop_mv, elapsed / 3600.0,
