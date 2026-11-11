@@ -47,7 +47,7 @@
 #endif
 
 // Firmware version: raise it for every OTA release (tools/ota_publish.py reads it from here)
-#define FIRMWARE_VERSION 13
+#define FIRMWARE_VERSION 14
 
 // OTA settings. The firmware holds no secrets (they live in NVS), so it can be hosted publicly.
 // The folder comes from NVS ("ota_dir"), so one binary can follow a test or a stable folder.
@@ -75,8 +75,8 @@
 #define REPORT_SLACK_SEC 60              // A report due within this is sent now instead of a sample later
 #define HOT_THRESHOLD_C 50.0
 #define HEATING_RISE_C 5.0
-#define ACTIVE_START_HOUR 7
-#define ACTIVE_END_HOUR 22
+#define ACTIVE_START_HOUR 6
+#define ACTIVE_END_HOUR 23
 #define LOCAL_TIMEZONE "CET-1CEST,M3.5.0,M10.5.0/3"  // Danish time with daylight saving
 
 // Define constants instead of magic numbers
