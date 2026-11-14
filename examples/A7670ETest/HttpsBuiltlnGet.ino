@@ -19,10 +19,7 @@
 #include "secrets.h"  // Only in the T-A7670X-provision build, never in OTA firmware
 #endif
 #include <TinyGsmClient.h>
-#include <WiFi.h>
 #include <esp32-hal-adc.h>
-#include <esp_wifi.h>
-#include <esp_bt.h>
 #include "driver/adc.h"
 #include "esp_adc_cal.h"
 #include <esp_task_wdt.h>    // <-- added for watchdog support
@@ -37,6 +34,7 @@
 #include "esp_ota_ops.h"
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <NimBLEDevice.h>
 
 // debug: set 0 to remove Serial prints to save power
 #define DEBUG 0
@@ -47,7 +45,7 @@
 #endif
 
 // Firmware version: raise it for every OTA release (tools/ota_publish.py reads it from here)
-#define FIRMWARE_VERSION 14
+#define FIRMWARE_VERSION 15
 
 // OTA settings. The firmware holds no secrets (they live in NVS), so it can be hosted publicly.
 // The folder comes from NVS ("ota_dir"), so one binary can follow a test or a stable folder.
@@ -81,7 +79,7 @@
 
 // Define constants instead of magic numbers
 #define RETRY_COUNT 3
-#define MAX_URL_LENGTH 192
+#define MAX_URL_LENGTH 256
 #define VOLTAGE_MULTIPLIER 2
 #define SIM_READY_TIMEOUT_MS 60000UL      // Give up waiting for the SIM after 1 minute
 #define NETWORK_REG_TIMEOUT_MS 180000UL   // Give up network registration after 3 minutes
@@ -102,7 +100,18 @@
 
 // ThingSpeak fields (same layout on every board):
 //   field1 firmware version, field2 outdoor temp (DS18B20), field3 indoor temp (MAX6675),
-//   field4 battery mV, field5 daily vDrop mV. A missing or faulty sensor leaves its field out.
+//   field4 battery mV, field5 daily vDrop mV, field6 Bluetooth sensor temp, field7 Bluetooth sensor
+//   battery mV, field8 Bluetooth signal strength (RSSI). A missing or faulty sensor leaves its field out.
+
+// Bluetooth temperature sensor (XIAO nRF52840, xiao/XiaoBleSender). It only advertises, so the board
+// scans for BT_SCAN_SEC before each report and uses the advertisement whose name matches.
+// The name comes from NVS ("bt_name"); a board without the setting uses BT_DEFAULT_NAME.
+// The company ID 0xFFFF is the shared test ID, so the name and format version are both checked.
+#define BT_DEFAULT_NAME "TestTempBTModule"
+#define BT_SCAN_SEC 5
+#define BT_COMPANY_ID 0xFFFF
+#define BT_FORMAT_VERSION 1
+#define BT_TEMP_INVALID 0x7FFF
 
 // DS18B20 outdoor sensor on GPIO0 (needs a 4.7k pull-up to 3.3V). Optional: if none answers, field2 is left out
 #define DS18B20_PIN 0
@@ -146,6 +155,17 @@ String alertPhone;
 String thingspeakKey;
 String thingspeakUrl;
 String otaBaseUrl;
+String btSensorName;
+
+// Latest reading from the Bluetooth sensor (valid only when found is true)
+struct BtReading {
+    bool found = false;
+    bool tempValid = false;
+    float tempC = NAN;
+    uint16_t batteryMv = 0;
+    uint16_t counter = 0;
+    int rssi = 0;
+};
 
 
 // Time & quiet-hours helpers
@@ -408,6 +428,11 @@ void loadSettings()
 #else
     prefs.remove("ota_dir");
 #endif
+#ifdef BT_SENSOR_NAME
+    prefs.putString("bt_name", BT_SENSOR_NAME);
+#else
+    prefs.remove("bt_name");
+#endif
     Serial.println("PROVISION: secrets written to NVS");
 #endif
     alertPhone = prefs.getString("phone", "");
@@ -426,6 +451,8 @@ void loadSettings()
     }
     otaBaseUrl = String(OTA_BASE_URL) + folder + "/";
     Serial.printf("OTA folder: %s\n", folder.c_str());
+    btSensorName = prefs.getString("bt_name", BT_DEFAULT_NAME);
+    Serial.printf("Bluetooth sensor: %s\n", btSensorName.c_str());
     if (alertPhone.length() == 0 || thingspeakKey.length() == 0) {
         Serial.println("WARNING: secrets missing in NVS - flash the T-A7670X-provision build once");
     }
@@ -747,11 +774,6 @@ void powerModemDown()
     // Read battery voltage to determine sleep duration
     uint32_t battery_voltage = analogReadMilliVolts(BOARD_BAT_ADC_PIN) * 2;
     
-    // Disable WiFi and Bluetooth before sleep
-    WiFi.mode(WIFI_OFF);
-    esp_wifi_stop();
-    btStop();
-
     // Pull up DTR to put the modem into sleep
     pinMode(MODEM_DTR_PIN, OUTPUT);
     digitalWrite(MODEM_DTR_PIN, HIGH);
@@ -990,40 +1012,48 @@ bool configureSSLForOTA() {
     return true;
 }
 
-void disableWiFiAndBT() {
-    // Disable WiFi
-    WiFi.mode(WIFI_OFF);
-    
-    // Initialize WiFi before trying to stop it
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_err_t result = esp_wifi_init(&cfg);
-    if (result == ESP_OK) {
-        result = esp_wifi_stop();
-        if (result == ESP_OK) {
-            result = esp_wifi_deinit();
-            if (result != ESP_OK) {
-                Serial.printf("WiFi deinit failed with error: %d\n", result);
-            }
-        } else {
-            Serial.printf("WiFi stop failed with error: %d\n", result);
+// Scan for the Bluetooth sensor. WiFi is never started and Bluetooth only runs during this scan,
+// so no radio needs switching off elsewhere (deep sleep powers both down anyway).
+BtReading scanBtSensor()
+{
+    BtReading r;
+    Serial.printf("Bluetooth: scanning %d s for %s\n", BT_SCAN_SEC, btSensorName.c_str());
+    NimBLEDevice::init("");
+    NimBLEScan *scan = NimBLEDevice::getScan();
+    scan->setActiveScan(true);  // The name is in the scan response
+    scan->setInterval(100);
+    scan->setWindow(99);
+    NimBLEScanResults results = scan->getResults(BT_SCAN_SEC * 1000, false);
+    for (int i = 0; i < results.getCount(); i++) {
+        const NimBLEAdvertisedDevice *dev = results.getDevice(i);
+        if (!dev->haveName() || btSensorName != dev->getName().c_str()) continue;
+        std::string md = dev->getManufacturerData();
+        const uint8_t *d = (const uint8_t *)md.data();
+        if (md.size() < 9 || (d[0] | (d[1] << 8)) != BT_COMPANY_ID || d[2] != BT_FORMAT_VERSION) {
+            Serial.printf("Bluetooth: %s found, but with unknown data (%u bytes)\n", btSensorName.c_str(), (unsigned)md.size());
+            continue;
         }
-    } else {
-        Serial.printf("WiFi init failed with error: %d\n", result);
+        r.found = true;
+        r.counter = d[3] | (d[4] << 8);
+        int16_t centi = (int16_t)(d[5] | (d[6] << 8));
+        r.tempValid = centi != BT_TEMP_INVALID;
+        r.tempC = r.tempValid ? centi / 100.0f : NAN;
+        r.batteryMv = d[7] | (d[8] << 8);
+        r.rssi = dev->getRSSI();
+        break;
     }
+    scan->clearResults();
+    NimBLEDevice::deinit(true);
 
-    // Disable Bluetooth
-    btStop();
-    if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED) {
-        if (esp_bt_controller_disable() != ESP_OK) {
-            Serial.println("BT controller disable failed");
-        }
+    if (!r.found) {
+        Serial.println("Bluetooth: sensor not heard, fields 6-8 left out");
+    } else if (r.tempValid) {
+        Serial.printf("Bluetooth: %.2f C, battery %u mV, RSSI %d dBm, counter %u\n", r.tempC, r.batteryMv, r.rssi, r.counter);
+    } else {
+        Serial.printf("Bluetooth: no temperature (sensor fault), battery %u mV, RSSI %d dBm, counter %u\n", r.batteryMv,
+                      r.rssi, r.counter);
     }
-    
-    if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_INITED) {
-        if (esp_bt_controller_mem_release(ESP_BT_MODE_BTDM) != ESP_OK) {
-            Serial.println("BT controller memory release failed");
-        }
-    }
+    return r;
 }
 
 void setup()
@@ -1123,6 +1153,9 @@ void setup()
         esp_deep_sleep_start();
     }
 
+    // Bluetooth before the modem starts, so the two never draw current at the same time
+    BtReading bt = scanBtSensor();
+
     // Check if this is a cold start from USB power
     if (isColdStart()) {
         Serial.println("Cold start detected - powering on modem automatically");
@@ -1165,9 +1198,6 @@ void setup()
 #if ESP_ARDUINO_VERSION_MAJOR < 3
     analogSetClockDiv(255);
 #endif
-    
-    // Disable WiFi and Bluetooth
-    disableWiFiAndBT();
     
     // Optimize modem power
     optimizeModemPower();
@@ -1444,6 +1474,12 @@ void setup()
         }
         if (vdrop_ready && used < MAX_URL_LENGTH) {
             used += snprintf(str + used, MAX_URL_LENGTH - used, "&field5=%ld", (long)vdrop_mv);
+        }
+        if (bt.found && bt.tempValid && used < MAX_URL_LENGTH) {
+            used += snprintf(str + used, MAX_URL_LENGTH - used, "&field6=%.1f", bt.tempC);
+        }
+        if (bt.found && used < MAX_URL_LENGTH) {
+            used += snprintf(str + used, MAX_URL_LENGTH - used, "&field7=%u&field8=%d", bt.batteryMv, bt.rssi);
         }
 
         printMaskedUrl("Request URL with data: ", str);
