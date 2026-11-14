@@ -2,7 +2,8 @@
 //
 // Measures a DS18B20 every MEASURE_INTERVAL_MS and broadcasts the value as a BLE advertisement.
 // There is no connection or pairing: a receiver (the A7670 board, or nRF Connect on a phone)
-// just listens for the advertisement and reads the manufacturer data.
+// just listens for the advertisement, checks the name and format version, and reads the
+// manufacturer data. The company ID 0xFFFF is shared by other test devices, so the name matters.
 //
 // Manufacturer data (little endian), 9 bytes:
 //   [0..1] company ID 0xFFFF (reserved for testing)
@@ -19,8 +20,14 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
-#define DEVICE_NAME "SoenTemp"
+// Each module gets its own name, so a receiver only uses its own module.
+// Override per module with -D DEVICE_NAME=\"...\" in platformio.ini.
+#ifndef DEVICE_NAME
+#define DEVICE_NAME "TestTempBTModule"
+#endif
 #define DS18B20_PIN D2
+#define PIN_HICHG 22  // P0.13 on the BQ25100 charger: LOW = 100 mA, HIGH = 50 mA
+#define PIN_CHG 23    // P0.17 ~CHG from the BQ25100: LOW while charging (green LED on)
 #define MEASURE_INTERVAL_MS (5UL * 60 * 1000)  // New measurement every 5 minutes
 #define ADV_INTERVAL_UNITS 1600                // Advertise every 1 s (units of 0.625 ms)
 #define TX_POWER_DBM 8                         // Maximum for the nRF52840, for range
@@ -92,10 +99,12 @@ void measureAndAdvertise()
     p.temp_centi = readTemperatureCenti();
     p.battery_mv = readBatteryMilliVolts();
 
+    const char *charge = digitalRead(PIN_CHG) == LOW ? "charging" : "not charging";
     if (p.temp_centi == TEMP_INVALID) {
-        Serial.printf("#%u  temp: no sensor  battery: %u mV\n", p.counter, p.battery_mv);
+        Serial.printf("#%u  temp: no sensor  battery: %u mV (%s)\n", p.counter, p.battery_mv, charge);
     } else {
-        Serial.printf("#%u  temp: %.2f C  battery: %u mV\n", p.counter, p.temp_centi / 100.0f, p.battery_mv);
+        Serial.printf("#%u  temp: %.2f C  battery: %u mV (%s)\n", p.counter, p.temp_centi / 100.0f, p.battery_mv,
+                      charge);
     }
     startAdvertising(p);
 }
@@ -107,6 +116,11 @@ void setup()
 
     pinMode(VBAT_ENABLE, OUTPUT);
     digitalWrite(VBAT_ENABLE, LOW);
+
+    // Charge with 100 mA instead of the default 50 mA. Charging only happens on USB indoors.
+    pinMode(PIN_HICHG, OUTPUT);
+    digitalWrite(PIN_HICHG, LOW);
+    pinMode(PIN_CHG, INPUT_PULLUP);
 
     sensors.begin();
     sensors.setResolution(12);
