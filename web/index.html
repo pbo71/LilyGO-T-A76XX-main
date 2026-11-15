@@ -26,6 +26,7 @@
   .card .label { color: var(--muted); font-size: .85rem; }
   .card .value { font-size: 1.6rem; font-weight: 600; margin: 2px 0; font-variant-numeric: tabular-nums; }
   .card .age { color: var(--muted); font-size: .75rem; }
+  .card.stale { opacity: .5; }  /* Not part of the latest report */
   .ranges { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
   .ranges button { border: 1px solid var(--line); background: var(--card); color: var(--text);
                    padding: 6px 14px; border-radius: 999px; cursor: pointer; font: inherit; font-size: .9rem; }
@@ -92,14 +93,23 @@ function age(ms) {
 }
 function timeText(ms, opts) { return new Date(ms).toLocaleString('da-DK', { timeZone: TZ, ...opts }); }
 
+// A value is stale when the latest report did not include it (e.g. the Bluetooth sensor was not
+// heard). vDrop is only sent once a day, so it is stale only after 36 hours.
+function isStale(f, t, newest) {
+  if (f === 'field5') return Date.now() - t > 36 * 3600e3;
+  return t < newest - 10 * 60e3;
+}
+
 function renderCards(latest) {
   const el = document.getElementById('cards');
   el.innerHTML = '';
+  const newest = Math.max(...Object.values(latest).filter(Boolean).map(l => l.t));
   for (const f of Object.keys(FIELDS)) {
     const l = latest[f];
     if (!l) continue;
     const card = document.createElement('div');
-    card.className = 'card';
+    card.className = isStale(f, l.t, newest) ? 'card stale' : 'card';
+    if (card.className.includes('stale')) card.title = 'Ikke med i seneste måling';
     card.innerHTML = `<div class="label"></div><div class="value"></div><div class="age"></div>`;
     card.querySelector('.label').textContent = label(f);
     card.querySelector('.value').textContent = `${fmt(f, l.v)} ${FIELDS[f].unit}`;
@@ -108,20 +118,60 @@ function renderCards(latest) {
   }
 }
 
+// Offset of Danish time from UTC at time t, in ms (handles summer time)
+function tzOffset(t) {
+  const p = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+    timeZone: TZ, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric',
+    hour: 'numeric', minute: 'numeric', second: 'numeric',
+  }).formatToParts(new Date(t)).map(x => [x.type, x.value]));
+  return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - Math.floor(t / 1000) * 1000;
+}
+
+// Axis span and ticks on whole hours, days or months in Danish time
+const RANGE = {
+  '24h': { span: 24 * 3600e3, step: 3 * 3600e3, label: { hour: '2-digit', minute: '2-digit' } },
+  '7d':  { span: 7 * 86400e3, step: 86400e3, label: { weekday: 'short', day: 'numeric' } },
+  '30d': { span: 30 * 86400e3, step: 5 * 86400e3, label: { day: 'numeric', month: 'short' } },
+  '1y':  { span: 365 * 86400e3, step: 0, label: { month: 'short' } },  // step 0 = first of each month
+};
+function axisTicks(min, max, range) {
+  const r = RANGE[range], ticks = [];
+  if (r.step === 0) {
+    const d = new Date(min + tzOffset(min));
+    let y = d.getUTCFullYear(), m = d.getUTCMonth() + 1;
+    for (;;) {
+      if (m > 11) { y++; m = 0; }
+      const local = Date.UTC(y, m, 1);
+      const t = local - tzOffset(local);
+      if (t > max) break;
+      ticks.push(t);
+      m++;
+    }
+    return ticks;
+  }
+  for (let local = Math.ceil((min + tzOffset(min)) / r.step) * r.step; ; local += r.step) {
+    const t = local - tzOffset(local);
+    if (t > max) break;
+    if (t >= min) ticks.push(t);
+  }
+  return ticks;
+}
+
 function renderCharts(rows, range) {
   const host = document.getElementById('charts');
   charts.forEach(c => c.destroy());
   charts.length = 0;
   host.innerHTML = '';
   const colors = [css('--c1'), css('--c2'), css('--c3')];
-  const tickOpts = range === '24h' ? { hour: '2-digit', minute: '2-digit' } : { day: 'numeric', month: 'short' };
+  const xMax = Date.now(), xMin = xMax - RANGE[range].span;
+  const ticks = axisTicks(xMin, xMax, range);
 
   for (const def of CHARTS) {
     const datasets = def.fields.map((f, i) => ({
       label: label(f),
       data: rows.filter(r => r[f] !== null).map(r => ({ x: r.t, y: value(f, r[f]) })),
       borderColor: colors[i], backgroundColor: colors[i],
-      borderWidth: 2, pointRadius: rows.length > 200 ? 0 : 2, tension: 0.2,
+      borderWidth: 2, pointRadius: rows.length > 200 ? 0 : 2, tension: 0,  // Straight lines: only measured values
     })).filter(d => d.data.length > 0);
     if (datasets.length === 0) continue;
 
@@ -138,8 +188,9 @@ function renderCharts(rows, range) {
         maintainAspectRatio: false, animation: false,
         interaction: { mode: 'nearest', axis: 'x', intersect: false },
         scales: {
-          x: { type: 'linear', grid: { color: css('--line') },
-               ticks: { color: css('--muted'), maxTicksLimit: 8, callback: v => timeText(v, tickOpts) } },
+          x: { type: 'linear', min: xMin, max: xMax, grid: { color: css('--line') },
+               afterBuildTicks: axis => { axis.ticks = ticks.map(value => ({ value })); },
+               ticks: { color: css('--muted'), callback: v => timeText(v, RANGE[range].label) } },
           y: { grid: { color: css('--line') }, ticks: { color: css('--muted') },
                title: { display: true, text: def.unit, color: css('--muted') } },
         },
