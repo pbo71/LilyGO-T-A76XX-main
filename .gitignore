@@ -5,3 +5,4 @@ script
 build
 extars
 examples/A7670ETest/secrets.h
+web/config.php
