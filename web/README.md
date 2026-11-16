@@ -1,13 +1,16 @@
 # Målinger on iot.boegebjerg.eu
 
-A public page with the measurements from a ThingSpeak channel. A cron job copies new entries
-into MySQL every 10 minutes and the page reads from the database. The ThingSpeak read key stays
+Public pages with the measurements from ThingSpeak channels: index.html for the test board and
+soen.html for the sauna board at Søen. A cron job copies new entries into MySQL every 10 minutes
+and the pages read from the database. The ThingSpeak read key stays
 on the server.
 
 | File | Purpose |
 |---|---|
-| index.html | The page (latest values and charts, Danish time) |
-| api.php | JSON for the page |
+| index.html | Page for the test board (channel 2695386) |
+| soen.html | Page for Søen (channel 674813) |
+| app.js, style.css | Shared code and style of the pages (latest values and charts, Danish time) |
+| api.php | JSON for the pages: `api.php?channel=<id>&range=24h` |
 | fetch.php | Copies new ThingSpeak entries into the database (cron) |
 | db.php | Shared database code |
 | config.example.php | Template for config.php (database, channel, keys) |
@@ -20,7 +23,8 @@ on the server.
    all privileges on it. cPanel puts your account name in front of both names.
 2. **Tables:** cPanel -> *phpMyAdmin*: select the database, open *SQL*, paste schema.sql and run it.
 3. **Config:** copy config.example.php to config.php and fill in the database values, the
-   channel ID and (for a private channel) the read API key.
+   channel ID and (for a private channel) the read API key. More channels go in `more_channels`;
+   each needs its own page with the channel ID and fields in `PAGE` (copy soen.html).
 4. **Upload:** cPanel -> *File Manager*: upload all files including .htaccess and config.php
    directly into the subdomain folder /home/boegebje/iot.boegebjerg.eu (next to cgi-bin and
    php.ini, which belong to the web hotel and stay as they are).

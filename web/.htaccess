@@ -1,4 +1,4 @@
-# Only index.html and api.php are for visitors. fetch.php checks its own token.
+# Only the pages (.html, app.js, style.css) and api.php are for visitors. fetch.php checks its own token.
 <FilesMatch "^(config\.php|config\.example\.php|db\.php|schema\.sql|README\.md)$">
     Require all denied
 </FilesMatch>

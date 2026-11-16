@@ -1,10 +1,11 @@
 <?php
-// JSON for the page: api.php?range=24h|7d|30d|1y
+// JSON for the pages: api.php?channel=<id>&range=24h|7d|30d|1y (channel defaults to channel_id)
 // Returns the field names, the latest value of every field and the measurements in the range.
 
 require __DIR__ . '/db.php';
 $cfg = load_config();
-$channel = (int)$cfg['channel_id'];
+$channels = channels($cfg);
+$channel = (int)($_GET['channel'] ?? array_key_first($channels));
 
 $ranges = ['24h' => 1, '7d' => 7, '30d' => 30, '1y' => 365];
 $range = $_GET['range'] ?? '24h';
@@ -13,6 +14,12 @@ if (!isset($ranges[$range])) {
 }
 
 header('Content-Type: application/json; charset=utf-8');
+
+// Only the channels in config.php
+if (!isset($channels[$channel])) {
+    http_response_code(404);
+    exit(json_encode(['error' => 'unknown channel']));
+}
 header('Cache-Control: public, max-age=120');
 
 try {

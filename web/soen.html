@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="da">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Søen</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <nav>
+    <a href="index.html">Test-board</a>
+    <a href="soen.html" class="active">Søen</a>
+  </nav>
+  <h1 id="title">Søen</h1>
+  <p class="sub" id="updated">Henter data …</p>
+
+  <div class="cards" id="cards"></div>
+
+  <div class="ranges" id="ranges">
+    <button data-range="24h" class="active">Døgn</button>
+    <button data-range="7d">Uge</button>
+    <button data-range="30d">Måned</button>
+    <button data-range="1y">År</button>
+  </div>
+
+  <div id="charts"></div>
+  <footer id="footer"></footer>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script>
+// Sauna board at Søen. Field 2 (outdoor) is left out: no DS18B20 there, and the old
+// firmware sent 0 in it until 2026-11-12.
+const PAGE = {
+  channel: 674813,
+  fields: {
+    field3: { name: 'Hyttetemperatur', unit: '°C', digits: 0 },
+    field4: { name: 'Batteri', unit: 'V', digits: 2, scale: 0.001 },
+    field5: { name: 'Batterifald pr. døgn', unit: 'mV', digits: 0, daily: true },
+  },
+  charts: [
+    { title: 'Hyttetemperatur', fields: ['field3'], unit: '°C' },
+    { title: 'Batteri', fields: ['field4'], unit: 'V' },
+  ],
+};
+</script>
+<script src="app.js"></script>
+</body>
+</html>

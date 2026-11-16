@@ -12,6 +12,9 @@ return [
     'channel_id' => 0,  // The number without leading zeros (PHP reads 0123 as octal)
     'read_key' => '',
 
+    // More channels to copy, each with its own page: channel ID => read key ('' when public)
+    'more_channels' => [],
+
     // Secret for running fetch.php as a URL (cron "call URL"): fetch.php?token=...
     // Use a long random string. Not needed when cron runs php fetch.php directly.
     'cron_token' => '',
