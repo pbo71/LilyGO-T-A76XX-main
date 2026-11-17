@@ -87,6 +87,18 @@ function axisTicks(min, max, range) {
   return ticks;
 }
 
+// Break the line where no value came for more than 3 hours (the night pause, or a sensor that
+// was not heard), so the chart does not draw a straight line through hours without measurements
+const GAP = 3 * 3600e3;
+function withGaps(points) {
+  const out = [];
+  points.forEach((p, i) => {
+    if (i > 0 && p.x - points[i - 1].x > GAP) out.push({ x: (p.x + points[i - 1].x) / 2, y: null });
+    out.push(p);
+  });
+  return out;
+}
+
 function renderCharts(rows, range) {
   const host = document.getElementById('charts');
   charts.forEach(c => c.destroy());
@@ -99,7 +111,7 @@ function renderCharts(rows, range) {
   for (const def of CHARTS) {
     const datasets = def.fields.map((f, i) => ({
       label: label(f),
-      data: rows.filter(r => r[f] !== null).map(r => ({ x: r.t, y: value(f, r[f]) })),
+      data: withGaps(rows.filter(r => r[f] !== null).map(r => ({ x: r.t, y: value(f, r[f]) }))),
       borderColor: colors[i], backgroundColor: colors[i],
       borderWidth: 2, pointRadius: rows.length > 200 ? 0 : 2, tension: 0,  // Straight lines: only measured values
     })).filter(d => d.data.length > 0);
