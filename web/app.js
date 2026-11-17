@@ -87,17 +87,11 @@ function axisTicks(min, max, range) {
   return ticks;
 }
 
-// Break the line where no value came for more than 3 hours (the night pause, or a sensor that
-// was not heard), so the chart does not draw a straight line through hours without measurements
+// Where no value came for more than 3 hours (the night pause, or a sensor that was not heard),
+// the line is drawn thin and dashed: there are no measurements in between
 const GAP = 3 * 3600e3;
-function withGaps(points) {
-  const out = [];
-  points.forEach((p, i) => {
-    if (i > 0 && p.x - points[i - 1].x > GAP) out.push({ x: (p.x + points[i - 1].x) / 2, y: null });
-    out.push(p);
-  });
-  return out;
-}
+const isGap = ctx => ctx.p1.parsed.x - ctx.p0.parsed.x > GAP;
+const gapSegment = { borderDash: ctx => isGap(ctx) ? [4, 4] : undefined, borderWidth: ctx => isGap(ctx) ? 1 : undefined };
 
 function renderCharts(rows, range) {
   const host = document.getElementById('charts');
@@ -111,9 +105,10 @@ function renderCharts(rows, range) {
   for (const def of CHARTS) {
     const datasets = def.fields.map((f, i) => ({
       label: label(f),
-      data: withGaps(rows.filter(r => r[f] !== null).map(r => ({ x: r.t, y: value(f, r[f]) }))),
+      data: rows.filter(r => r[f] !== null).map(r => ({ x: r.t, y: value(f, r[f]) })),
       borderColor: colors[i], backgroundColor: colors[i],
       borderWidth: 2, pointRadius: rows.length > 200 ? 0 : 2, tension: 0,  // Straight lines: only measured values
+      segment: gapSegment,
     })).filter(d => d.data.length > 0);
     if (datasets.length === 0) continue;
 
