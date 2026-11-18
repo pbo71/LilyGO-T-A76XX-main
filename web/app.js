@@ -2,7 +2,7 @@
 //   channel: ThingSpeak channel ID (must be in config.php)
 //   fields:  the fields to show, in card order: name (fallback when ThingSpeak has none), unit,
 //            digits, optional scale, and daily: true for values sent once a day
-//   charts:  title, fields and unit of each chart
+//   charts:  title, fields and unit of each chart, optional minSpan (smallest y axis span)
 const { channel: CHANNEL, fields: FIELDS, charts: CHARTS } = PAGE;
 const TZ = 'Europe/Copenhagen';
 const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -93,6 +93,15 @@ const GAP = 3 * 3600e3;
 const isGap = ctx => ctx.p1.parsed.x - ctx.p0.parsed.x > GAP;
 const gapSegment = { borderDash: ctx => isGap(ctx) ? [4, 4] : undefined, borderWidth: ctx => isGap(ctx) ? 1 : undefined };
 
+// Keep the y axis at least `span` tall around the data, so a few mV of noise does not look like
+// big jumps
+function minSpan(axis, span) {
+  if (!span || axis.max - axis.min >= span) return;
+  const mid = (axis.max + axis.min) / 2;
+  axis.min = mid - span / 2;
+  axis.max = mid + span / 2;
+}
+
 function renderCharts(rows, range) {
   const host = document.getElementById('charts');
   charts.forEach(c => c.destroy());
@@ -129,6 +138,7 @@ function renderCharts(rows, range) {
                afterBuildTicks: axis => { axis.ticks = ticks.map(value => ({ value })); },
                ticks: { color: css('--muted'), callback: v => timeText(v, RANGE[range].label) } },
           y: { grid: { color: css('--line') }, ticks: { color: css('--muted') },
+               afterDataLimits: axis => minSpan(axis, def.minSpan),
                title: { display: true, text: def.unit, color: css('--muted') } },
         },
         plugins: {
