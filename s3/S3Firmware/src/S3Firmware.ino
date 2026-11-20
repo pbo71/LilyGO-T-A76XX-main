@@ -121,10 +121,12 @@
 // The sensor pins are camera pins on the pin header; free as long as no camera is fitted
 #define DS18B20_PIN 16
 
-// MAX6675 thermocouple for the indoor (sauna / hut) temperature
-#define MAX6675_SCK_PIN GPIO_NUM_21
-#define MAX6675_CS_PIN GPIO_NUM_14
-#define MAX6675_SO_PIN GPIO_NUM_9
+// MAX6675 thermocouple for the indoor (sauna / hut) temperature (bit-banged, so any free pins work)
+// All on the header row with V_BAT at pin 1 and 3V3 at pin 16 (VCC pin 16, GND pin 15). The silkscreen
+// (pin 2 MISO, 3 SCK, 4 MOSI) matches LilyGO's code (MISO 13, SCK 12, MOSI 11), not the online schematic.
+#define MAX6675_SCK_PIN GPIO_NUM_13  // pin 2, silkscreen MISO
+#define MAX6675_SO_PIN GPIO_NUM_12   // pin 3, silkscreen SCK
+#define MAX6675_CS_PIN GPIO_NUM_11   // pin 4, silkscreen MOSI
 #define MAX6675_DEBUG 0  // Set 1 to print the raw MAX6675 word every cycle (wiring debug)
 #define MAX6675_MAX_PLAUSIBLE_C 150.0  // Readings above this are treated as wiring noise
 #define MAX6675_MAX_DIFF_C 2.0         // Two reads 250 ms apart must agree within this
@@ -340,16 +342,16 @@ float readThermocoupleOnce()
     }
     digitalWrite(MAX6675_CS_PIN, HIGH);
 
-#if MAX6675_DEBUG
+#if MAX6675_DEBUG || defined(MAX6675_TEST_LOOP)
     Serial.printf("MAX6675 raw: 0x%04X\n", raw);
 #endif
 
     const char *fault = NULL;
     if (raw == 0xFFFF) {
-        fault = "SO is always HIGH - SO wire (GPIO9) loose, or no VCC/GND to the module";
+        fault = "SO is always HIGH - SO wire (GPIO12, header pin 3) loose, or no VCC/GND to the module";
     } else if (raw == 0x0000) {
         // Also what a powerless module returns; a real 0.00-0.24 C reading is dropped too
-        fault = "SO is always LOW - check the CS (13) / SCK (18) wires and GND to the module";
+        fault = "SO is always LOW - check the CS (GPIO11, header pin 4) / SCK (GPIO13, header pin 2) wires and GND to the module";
     } else if (raw & 0x8002) {
         // Bit 15 and bit 1 are always 0 on a working MAX6675
         fault = "invalid bits set - loose wire or noise on SO/SCK";
@@ -1079,6 +1081,17 @@ void setup()
     tzset();
     printResetAndWakeReason();
     initThermocouplePins();
+#ifdef MAX6675_TEST_LOOP
+    // Wiring test (env T-SIM7670G-S3-max6675test): read the MAX6675 once a second forever, no modem,
+    // so a logic analyzer can watch CS/SCK/SO. Build the normal env again afterwards.
+    Serial.printf("MAX6675 test loop: SCK GPIO%d, CS GPIO%d, SO GPIO%d\n", MAX6675_SCK_PIN, MAX6675_CS_PIN, MAX6675_SO_PIN);
+    for (uint32_t n = 1;; n++) {
+        delay(1000);
+        Serial.printf("#%u SO idle (CS high): %d  ", n, digitalRead(MAX6675_SO_PIN));
+        float c = readThermocoupleOnce();
+        if (!isnan(c)) Serial.printf("%.2f C\n", c);
+    }
+#endif
     Serial.printf("Firmware version: %d%s\n", FIRMWARE_VERSION, otaPendingVerify() ? " (new, waiting for confirmation)" : "");
 
     // RTC data from another build (power-on, or the first wake after an OTA update) is not valid
