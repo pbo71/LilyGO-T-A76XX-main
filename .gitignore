@@ -6,3 +6,4 @@ build
 extars
 examples/A7670ETest/secrets.h
 web/config.php
+s3/S3Firmware/src/secrets.h
