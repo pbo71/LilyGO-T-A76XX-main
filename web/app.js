@@ -2,6 +2,8 @@
 //   channel: ThingSpeak channel ID (must be in config.php)
 //   fields:  the fields to show, in card order: name (fallback when ThingSpeak has none), unit,
 //            digits, optional scale, and daily: true for values sent once a day
+//            optional zones: [{ below, color }, ...] colours the value and its chart line,
+//            optional gauge: { min, max } shows the card as a dial with the zones
 //   charts:  title, fields and unit of each chart, optional minSpan (smallest y axis span)
 const { channel: CHANNEL, fields: FIELDS, charts: CHARTS } = PAGE;
 const TZ = 'Europe/Copenhagen';
@@ -30,6 +32,37 @@ function isStale(f, t, newest) {
   return t < newest - 10 * 60e3;
 }
 
+// Colour of a value from the field's zones (undefined when the field has none)
+function zoneColor(f, v) {
+  const z = FIELDS[f].zones;
+  return z ? (z.find(x => v < x.below) || z[z.length - 1]).color : undefined;
+}
+
+// Dial like a car gauge: 270 degrees, open at the bottom, coloured zones, ticks every 10
+function gaugeSvg(f, v) {
+  const { min, max } = FIELDS[f].gauge, zones = FIELDS[f].zones || [];
+  const C = 100, R = 80;
+  const ang = x => (-135 + 270 * (Math.min(Math.max(x, min), max) - min) / (max - min)) * Math.PI / 180;
+  const pt = (x, r) => [C + r * Math.sin(ang(x)), C - r * Math.cos(ang(x))].map(n => n.toFixed(1)).join(' ');
+  const arc = (a, b, cls, color) =>
+    `<path class="${cls}" d="M ${pt(a, R)} A ${R} ${R} 0 ${270 * (b - a) / (max - min) > 180 ? 1 : 0} 1 ${pt(b, R)}"` +
+    (color ? ` style="stroke:${color}"` : '') + '/>';
+  let svg = `<svg viewBox="0 0 200 175" role="img">` + arc(min, max, 'track');
+  let from = min;
+  for (const z of zones) {
+    const to = Math.min(z.below, max);
+    if (to > from) svg += arc(from, to, 'zone', z.color);
+    from = Math.max(from, to);
+  }
+  for (let x = min; x <= max; x += 10) {
+    svg += `<path class="tick" d="M ${pt(x, R - 7)} L ${pt(x, R + 5)}"/>`;
+    const [tx, ty] = pt(x, R - 19).split(' ');
+    svg += `<text x="${tx}" y="${ty}" dy="3.5" text-anchor="middle">${x}</text>`;
+  }
+  svg += `<path class="needle" d="M ${pt(v, -10)} L ${pt(v, R - 12)}"/><circle class="hub" cx="${C}" cy="${C}" r="5"/>`;
+  return svg + '</svg>';
+}
+
 function renderCards(latest) {
   const el = document.getElementById('cards');
   el.innerHTML = '';
@@ -40,7 +73,11 @@ function renderCards(latest) {
     const card = document.createElement('div');
     card.className = isStale(f, l.t, newest) ? 'card stale' : 'card';
     if (card.className.includes('stale')) card.title = 'Ikke med i seneste måling';
-    card.innerHTML = `<div class="label"></div><div class="value"></div><div class="age"></div>`;
+    const gauge = FIELDS[f].gauge;
+    if (gauge) card.classList.add('gauge');
+    card.innerHTML = `<div class="label"></div>${gauge ? gaugeSvg(f, value(f, l.v)) : ''}<div class="value"></div><div class="age"></div>`;
+    const color = zoneColor(f, value(f, l.v));
+    if (color) card.querySelector('.value').style.color = color;
     card.querySelector('.label').textContent = label(f);
     card.querySelector('.value').textContent = `${fmt(f, l.v)} ${FIELDS[f].unit}`;
     card.querySelector('.age').textContent = age(l.t);
@@ -118,6 +155,10 @@ function renderCharts(rows, range) {
       borderColor: colors[i], backgroundColor: colors[i],
       borderWidth: 2, pointRadius: rows.length > 200 ? 0 : 2, tension: 0,  // Straight lines: only measured values
       segment: gapSegment,
+      ...(FIELDS[f].zones && {  // Line and points in the zone colours (average of the two ends)
+        segment: { ...gapSegment, borderColor: ctx => zoneColor(f, (ctx.p0.parsed.y + ctx.p1.parsed.y) / 2) },
+        pointBackgroundColor: ctx => zoneColor(f, ctx.raw?.y), pointBorderColor: ctx => zoneColor(f, ctx.raw?.y),
+      }),
     })).filter(d => d.data.length > 0);
     if (datasets.length === 0) continue;
 

@@ -20,7 +20,15 @@ h1 { font-size: 1.5rem; margin: 0 0 4px; }
 .card .label { color: var(--muted); font-size: .85rem; }
 .card .value { font-size: 1.6rem; font-weight: 600; margin: 2px 0; font-variant-numeric: tabular-nums; }
 .card .age { color: var(--muted); font-size: .75rem; }
-.card.stale { opacity: .5; }  /* Not part of the latest report */
+.card.stale { opacity: .5; }
+.card.gauge { grid-column: span 2; text-align: center; }  /* Dial (see gaugeSvg in app.js) */
+.card.gauge svg { display: block; width: 100%; max-width: 230px; margin: 4px auto -6px; }
+.gauge .track { fill: none; stroke: var(--line); stroke-width: 12; }
+.gauge .zone { fill: none; stroke-width: 12; }
+.gauge .tick { stroke: var(--muted); stroke-width: 1.5; }
+.gauge text { fill: var(--muted); font-size: 10px; }
+.gauge .needle { stroke: var(--text); stroke-width: 3; stroke-linecap: round; }
+.gauge .hub { fill: var(--text); }  /* Not part of the latest report */
 .ranges { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
 .ranges button { border: 1px solid var(--line); background: var(--card); color: var(--text);
                  padding: 6px 14px; border-radius: 999px; cursor: pointer; font: inherit; font-size: .9rem; }

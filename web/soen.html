@@ -35,7 +35,13 @@
 const PAGE = {
   channel: 674813,
   fields: {
-    field3: { name: 'Hyttetemperatur', unit: '°C', digits: 0 },
+    field3: { name: 'Hyttetemperatur', unit: '°C', digits: 0, gauge: { min: 0, max: 130 },
+              zones: [  // Like the gauge on soeensfolk.dk
+                { below: 40, color: '#3b8fe0' },   // Cold
+                { below: 70, color: '#5bbf2a' },   // Warming up
+                { below: 100, color: '#f08c00' },  // Ready
+                { below: Infinity, color: '#e03131' },  // Very hot
+              ] },
     field4: { name: 'Batteri', unit: 'V', digits: 2, scale: 0.001 },
     field5: { name: 'Batterifald pr. døgn', unit: 'mV', digits: 0, daily: true },
   },
