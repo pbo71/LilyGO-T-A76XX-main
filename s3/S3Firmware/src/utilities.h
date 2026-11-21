@@ -21,6 +21,7 @@
 // The modem boot pin needs to follow the startup sequence. There is no modem reset pin.
 #define BOARD_PWRKEY_PIN (46)
 #define MODEM_POWERON_PULSE_MS (100)  // SIM7670G power-on pulse (upstream value); 2.5 s or more switches it off
+#define MODEM_POWEROFF_PULSE_MS (3000)  // SIM7670G power-off pulse (upstream value)
 
 // Connected to voltage dividers (half the voltage); cannot be used for anything else
 #define BOARD_BAT_ADC_PIN (8)

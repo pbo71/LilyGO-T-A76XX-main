@@ -49,7 +49,7 @@
 #endif
 
 // Firmware version: raise it for every OTA release (tools/ota_publish.py reads it from here)
-#define FIRMWARE_VERSION 1
+#define FIRMWARE_VERSION 2
 
 // OTA settings. The firmware holds no secrets (they live in NVS), so it can be hosted publicly.
 // The folder comes from NVS ("ota_dir"), so one binary can follow a test or a stable folder.
@@ -776,6 +776,53 @@ void sendLowBatterySMS(uint32_t voltage)
     }
 }
 
+#ifndef MODEM_RESET_PIN
+// A modem that was on when the ESP32 reset (RST, watchdog, OTA restart) can come back half alive: it answers
+// AT and the SIM check, but rejects the APN and never answers the registration query, and AT+CPOF does not
+// switch it off either. It runs straight off the battery, so without a reset pin only PWRKEY can restart it.
+// Returns true when the modem answers AT again with the SIM ready.
+bool restartHungModem()
+{
+    Serial.println("Modem looks hung - PWRKEY power off, then on");
+    digitalWrite(BOARD_PWRKEY_PIN, HIGH);  // Long press: power off
+    delay(MODEM_POWEROFF_PULSE_MS);
+    digitalWrite(BOARD_PWRKEY_PIN, LOW);
+    for (int i = 0; i < 10; i++) {  // Let it shut down completely
+        esp_task_wdt_reset();
+        delay(1000);
+    }
+    digitalWrite(BOARD_PWRKEY_PIN, HIGH);  // Short press: power on
+    delay(MODEM_POWERON_PULSE_MS);
+    digitalWrite(BOARD_PWRKEY_PIN, LOW);
+
+    unsigned long start = millis();
+    while (!modem.testAT(1000)) {
+        esp_task_wdt_reset();
+        if (millis() - start > 30000) {
+            Serial.println("Modem did not come back after the restart");
+            return false;
+        }
+    }
+    start = millis();
+    while (modem.getSimStatus() != SIM_READY) {
+        esp_task_wdt_reset();
+        if (millis() - start > 20000) {
+            Serial.println("SIM not ready after the modem restart");
+            return false;
+        }
+        delay(1000);
+    }
+    Serial.println("Modem restarted, SIM ready");
+#ifdef NETWORK_APN
+    modem.sendAT(GF("+CGDCONT=1,\"IP\",\""), NETWORK_APN, "\"");
+    if (modem.waitResponse() != 1) {
+        Serial.println("Set network apn error after the restart");
+    }
+#endif
+    return true;
+}
+#endif
+
 void powerModemDown()
 {
     // Read battery voltage to determine sleep duration
@@ -789,14 +836,15 @@ void powerModemDown()
     // modem shutdown sequence...
     LOG("Check modem online .\n");
     unsigned long start = millis();
+    bool answered = true;
     while (!modem.testAT())
     {
         esp_task_wdt_reset();
-        if (millis() - start > 15000) break; // timeout
+        if (millis() - start > 15000) { answered = false; break; } // timeout
         Serial.print(".");
         delay(500);
     }
-    Serial.println("Modem is online !");
+    Serial.println(answered ? "Modem is online !" : "Modem does not answer");
 
     delay(5000);  // Keep this longer
 
@@ -809,6 +857,17 @@ void powerModemDown()
     else
     {
         Serial.println("modem power off failed!");
+#ifndef MODEM_RESET_PIN
+        // A hung modem ignores AT+CPOF and would stay on (off the battery) through the sleep. It answered AT
+        // just now, so it is on: a long PWRKEY press switches it off. Not done when it did not answer, as the
+        // press would switch an already-off modem on.
+        if (answered) {
+            Serial.println("PWRKEY long press to switch the modem off");
+            digitalWrite(BOARD_PWRKEY_PIN, HIGH);
+            delay(MODEM_POWEROFF_PULSE_MS);
+            digitalWrite(BOARD_PWRKEY_PIN, LOW);
+        }
+#endif
     }
 
     delay(5000);  // Keep this longer
@@ -1278,7 +1337,7 @@ void setup()
     Serial.println("Verifying modem is online...");
 
     int retry = 0;
-    int max_retries = 30;
+    int max_retries = 45;
 
     while (!modem.testAT(1000))
     {
@@ -1287,10 +1346,25 @@ void setup()
 #ifndef MODEM_RESET_PIN
         // Without a reset pin the PWRKEY pulse is the only way to start the modem; repeat it when it
         // does not answer (like the LilyGO examples). A short pulse never switches a running modem off.
-        if (retry == 10 || retry == 20) {
+        if (retry == 10) {
             Serial.println("Modem not answering - PWRKEY pulse again");
             digitalWrite(BOARD_PWRKEY_PIN, LOW);
             delay(100);
+            digitalWrite(BOARD_PWRKEY_PIN, HIGH);
+            delay(MODEM_POWERON_PULSE_MS);
+            digitalWrite(BOARD_PWRKEY_PIN, LOW);
+        }
+        // The modem runs straight off the battery, so a hung modem (e.g. the ESP32 was reset while it
+        // was on) stays hung through deep sleep. Power-cycle it with PWRKEY: a long pulse switches a
+        // running modem off; if it was off, the long pulse starts it and the short one is ignored.
+        if (retry == 20) {
+            Serial.println("Modem still not answering - PWRKEY power off, then on");
+            digitalWrite(BOARD_PWRKEY_PIN, HIGH);
+            delay(MODEM_POWEROFF_PULSE_MS);
+            digitalWrite(BOARD_PWRKEY_PIN, LOW);
+            esp_task_wdt_reset();
+            delay(8000);  // Let it shut down completely
+            esp_task_wdt_reset();
             digitalWrite(BOARD_PWRKEY_PIN, HIGH);
             delay(MODEM_POWERON_PULSE_MS);
             digitalWrite(BOARD_PWRKEY_PIN, LOW);
@@ -1313,9 +1387,22 @@ void setup()
     // Check if SIM card is online
     SimStatus sim = SIM_ERROR;
     unsigned long sim_wait_start = millis();
+    bool modem_restarted = false;  // restartHungModem() is tried at most once per run
     while (sim != SIM_READY)
     {
         esp_task_wdt_reset();  // Reset watchdog during SIM checks
+#ifndef MODEM_RESET_PIN
+        // The SIM is normally ready within seconds; a modem that answers AT but not this is hung
+        if (!modem_restarted && millis() - sim_wait_start > 20000) {
+            modem_restarted = true;
+            if (restartHungModem()) {
+                Serial.println("SIM card online");
+                break;
+            }
+            modem_initialized = false;
+            powerModemDown();  // Does not return: enters deep sleep
+        }
+#endif
         if (millis() - sim_wait_start > SIM_READY_TIMEOUT_MS)
         {
             Serial.println("SIM card not ready before timeout. Powering down until next cycle...");
@@ -1361,6 +1448,7 @@ void setup()
     Serial.print("Wait for the modem to register with the network.");
     RegStatus status = REG_NO_RESULT;
     unsigned long reg_wait_start = millis();
+    int no_answer = 0;         // Registration queries in a row without an answer (status -1)
     // REG_EMERGENCY (11) can show up briefly after start; it gives no data service, so keep waiting
     while (status == REG_NO_RESULT || status == REG_SEARCHING || status == REG_UNREGISTERED ||
            (int)status == 11)  // REG_EMERGENCY; the SIM7672 driver has no name for it
@@ -1373,6 +1461,22 @@ void setup()
             powerModemDown();
         }
         status = modem.getRegistrationStatus();
+#ifndef MODEM_RESET_PIN
+        // A working modem always answers this query, even while searching; 15 silent answers in a row
+        // means it is hung. Restart it once instead of waiting out the 3 minute timeout.
+        no_answer = (status == REG_NO_RESULT) ? no_answer + 1 : 0;
+        if (no_answer >= 15 && !modem_restarted) {
+            modem_restarted = true;
+            no_answer = 0;
+            if (!restartHungModem()) {
+                modem_initialized = false;
+                powerModemDown();  // Does not return: enters deep sleep
+            }
+            reg_wait_start = millis();
+            Serial.print("Wait for the modem to register with the network.");
+            continue;
+        }
+#endif
         switch (status)
         {
         case REG_UNREGISTERED:
