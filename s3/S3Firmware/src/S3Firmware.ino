@@ -49,7 +49,7 @@
 #endif
 
 // Firmware version: raise it for every OTA release (tools/ota_publish.py reads it from here)
-#define FIRMWARE_VERSION 2
+#define FIRMWARE_VERSION 3
 
 // OTA settings. The firmware holds no secrets (they live in NVS), so it can be hosted publicly.
 // The folder comes from NVS ("ota_dir"), so one binary can follow a test or a stable folder.
@@ -112,7 +112,7 @@
 // The name comes from NVS ("bt_name"); a board without the setting uses BT_DEFAULT_NAME.
 // The company ID 0xFFFF is the shared test ID, so the name and format version are both checked.
 #define BT_DEFAULT_NAME "TestTempBTModule"
-#define BT_SCAN_SEC 5
+#define BT_SCAN_SEC 8  // Longer than for 1M only: the scan alternates between the 1M and Coded PHY
 #define BT_COMPANY_ID 0xFFFF
 #define BT_FORMAT_VERSION 1
 #define BT_TEMP_INVALID 0x7FFF
@@ -172,6 +172,7 @@ struct BtReading {
     uint16_t batteryMv = 0;
     uint16_t counter = 0;
     int rssi = 0;
+    bool coded = false;  // Heard on the Coded PHY (long range) rather than 1M
 };
 
 
@@ -1086,9 +1087,12 @@ BtReading scanBtSensor()
     Serial.printf("Bluetooth: scanning %d s for %s\n", BT_SCAN_SEC, btSensorName.c_str());
     NimBLEDevice::init("");
     NimBLEScan *scan = NimBLEDevice::getScan();
-    scan->setActiveScan(true);  // The name is in the scan response
+    scan->setActiveScan(true);  // A legacy (1M) sender has the name in the scan response
     scan->setInterval(100);
     scan->setWindow(99);
+#if CONFIG_BT_NIMBLE_EXT_ADV
+    scan->setPhy(NimBLEScan::Phy::SCAN_ALL);  // 1M and Coded PHY (long range sender) in turn
+#endif
     NimBLEScanResults results = scan->getResults(BT_SCAN_SEC * 1000, false);
     Serial.printf("Bluetooth: %d devices seen\n", results.getCount());
     for (int i = 0; i < results.getCount(); i++) {
@@ -1107,6 +1111,9 @@ BtReading scanBtSensor()
         r.tempC = r.tempValid ? centi / 100.0f : NAN;
         r.batteryMv = d[7] | (d[8] << 8);
         r.rssi = dev->getRSSI();
+#if CONFIG_BT_NIMBLE_EXT_ADV
+        r.coded = dev->getPrimaryPhy() == BLE_HCI_LE_PHY_CODED;
+#endif
         break;
     }
     scan->clearResults();
@@ -1115,10 +1122,11 @@ BtReading scanBtSensor()
     if (!r.found) {
         Serial.println("Bluetooth: sensor not heard, fields 6-8 left out");
     } else if (r.tempValid) {
-        Serial.printf("Bluetooth: %.2f C, battery %u mV, RSSI %d dBm, counter %u\n", r.tempC, r.batteryMv, r.rssi, r.counter);
+        Serial.printf("Bluetooth: %.2f C, battery %u mV, RSSI %d dBm, counter %u, %s\n", r.tempC, r.batteryMv, r.rssi,
+                      r.counter, r.coded ? "Coded PHY" : "1M");
     } else {
-        Serial.printf("Bluetooth: no temperature (sensor fault), battery %u mV, RSSI %d dBm, counter %u\n", r.batteryMv,
-                      r.rssi, r.counter);
+        Serial.printf("Bluetooth: no temperature (sensor fault), battery %u mV, RSSI %d dBm, counter %u, %s\n",
+                      r.batteryMv, r.rssi, r.counter, r.coded ? "Coded PHY" : "1M");
     }
     return r;
 }

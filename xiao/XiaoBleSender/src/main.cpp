@@ -12,6 +12,11 @@
 //   [5..6] temperature in 1/100 C (int16), 0x7FFF = no sensor
 //   [7..8] battery in mV (uint16)
 //
+// Long range: by default the advertisement goes out on the Coded PHY (BLE 5 long range, about 4x the
+// range of 1M) as a non-connectable extended advertisement with the name and data in one packet. Only
+// BLE 5 Coded PHY receivers hear it (the ESP32-S3 board, many newer phones); the classic ESP32 A7670
+// board does not. Build with -D ADV_LEGACY to send the old 1M legacy advertisement instead.
+//
 // Wiring: DS18B20 VDD -> 3V3, GND -> GND, DATA -> D2, 4.7 kOhm between DATA and 3V3.
 
 #include <Arduino.h>
@@ -76,6 +81,59 @@ int16_t readTemperatureCenti()
     return (int16_t)lroundf(c * 100.0f);
 }
 
+#ifndef ADV_LEGACY
+// Bluefruit always advertises on 1M, so the Coded PHY set is configured on the SoftDevice directly.
+// The SoftDevice reads the buffer while advertising, so it is static and only changed while stopped.
+static uint8_t advData[64];
+static uint8_t advHandle = BLE_GAP_ADV_SET_HANDLE_NOT_SET;
+static bool advRunning = false;
+
+void startAdvertising(const Payload &p)
+{
+    if (advRunning) {
+        sd_ble_gap_adv_stop(advHandle);
+        advRunning = false;
+    }
+
+    uint8_t len = 0;
+    advData[len++] = 2;  // Flags
+    advData[len++] = BLE_GAP_AD_TYPE_FLAGS;
+    advData[len++] = BLE_GAP_ADV_FLAG_BR_EDR_NOT_SUPPORTED;
+    const uint8_t nameLen = strlen(DEVICE_NAME);
+    advData[len++] = nameLen + 1;  // Complete local name
+    advData[len++] = BLE_GAP_AD_TYPE_COMPLETE_LOCAL_NAME;
+    memcpy(&advData[len], DEVICE_NAME, nameLen);
+    len += nameLen;
+    advData[len++] = sizeof(p) + 1;  // Manufacturer data
+    advData[len++] = BLE_GAP_AD_TYPE_MANUFACTURER_SPECIFIC_DATA;
+    memcpy(&advData[len], &p, sizeof(p));
+    len += sizeof(p);
+
+    static ble_gap_adv_data_t data;
+    data.adv_data.p_data = advData;
+    data.adv_data.len = len;
+    data.scan_rsp_data.p_data = NULL;
+    data.scan_rsp_data.len = 0;
+
+    ble_gap_adv_params_t params;
+    memset(&params, 0, sizeof(params));
+    params.properties.type = BLE_GAP_ADV_TYPE_EXTENDED_NONCONNECTABLE_NONSCANNABLE_UNDIRECTED;
+    params.interval = ADV_INTERVAL_UNITS;
+    params.duration = 0;  // Until stopped
+    params.filter_policy = BLE_GAP_ADV_FP_ANY;
+    params.primary_phy = BLE_GAP_PHY_CODED;
+    params.secondary_phy = BLE_GAP_PHY_CODED;
+
+    uint32_t err = sd_ble_gap_adv_set_configure(&advHandle, &data, &params);
+    if (err == NRF_SUCCESS) err = sd_ble_gap_tx_power_set(BLE_GAP_TX_POWER_ROLE_ADV, advHandle, TX_POWER_DBM);
+    if (err == NRF_SUCCESS) err = sd_ble_gap_adv_start(advHandle, BLE_CONN_CFG_TAG_DEFAULT);
+    if (err != NRF_SUCCESS) {
+        Serial.printf("Coded PHY advertising failed: error 0x%lX\n", (unsigned long)err);
+        return;
+    }
+    advRunning = true;
+}
+#else
 void startAdvertising(const Payload &p)
 {
     Bluefruit.Advertising.stop();
@@ -89,6 +147,7 @@ void startAdvertising(const Payload &p)
     Bluefruit.Advertising.restartOnDisconnect(false);
     Bluefruit.Advertising.start(0);  // 0 = advertise until stopped
 }
+#endif
 
 void measureAndAdvertise()
 {
@@ -124,7 +183,12 @@ void setup()
 
     sensors.begin();
     sensors.setResolution(12);
-    Serial.printf("XIAO BLE sender, %d DS18B20 found\n", sensors.getDeviceCount());
+#ifdef ADV_LEGACY
+    const char *phy = "1M legacy";
+#else
+    const char *phy = "Coded PHY (long range)";
+#endif
+    Serial.printf("XIAO BLE sender %s, %s, %d DS18B20 found\n", DEVICE_NAME, phy, sensors.getDeviceCount());
 
     Bluefruit.begin();
     Bluefruit.setTxPower(TX_POWER_DBM);
